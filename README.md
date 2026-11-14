@@ -68,6 +68,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | GET | `/capabilities` | 接口能力清单（含格式支持） |
 | GET | `/workspaces` | 工作区列表（含 workspaceId，用于新建会话） |
 | GET | `/sessions/:id/approvals` | 列出本插件持有的待决审批 |
+| GET | `/sessions/:id/questions` | 列出待答提问（ask_user_question） |
 | GET | `/sessions` | 会话列表 |
 | GET | `/sessions/:id` | 单个会话 |
 | GET | `/sessions/:id/state` | 运行状态、队列、待输入 |
@@ -90,6 +91,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | POST | `/workspaces/:id/sessions` | `{text, mode?, agentPreset?}` | **在指定工作区新建会话并立即执行首条任务** |
 | POST | `/sessions/create` | `{cwd, text, mode?, agentPreset?}` | 在指定目录（须**已存在**）新建会话并执行首条任务 |
 | POST | `/sessions/:id/approvals/:decisionId` | `{decision: "allow"\|"deny"}` | 裁决一条待决审批（仅本次生效） |
+| POST | `/sessions/:id/questions/:callId` | `{answers:[{id,selected,custom?}]}` | 回答一条待答提问 |
 
 ## 示例：在指定工作区新建会话并下达任务
 
@@ -155,6 +157,29 @@ curl -s -X POST "$BASE/sessions/$SID/approvals/$DECISION_ID" \
 
 > **只影响这一条审批**。DSH 的审批结果只有「单次放行 / 拒绝」两种，没有「以后都放行」。若要让某类命令以后不再询问，请用 `POST /sessions/:id/permission` 切换权限档位——那才是 DSH 提供的持久机制。
 
+## 示例：回答一个提问
+
+`ask_user_question` 让 agent 停下来等选择时，可以从外部作答：
+
+```bash
+# 1. 看有什么在等回答（含问题 id 与选项）
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/sessions/$SID/questions?format=md"
+
+# 2. 回答（answers 要为每个问题各提供一项）
+curl -s -X POST "$BASE/sessions/$SID/questions/$CALL_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"answers":[{"id":"q1","selected":["方案 A"]}]}'
+```
+
+单选场景可以简写，`selected` 会按投影里的第一个问题自动展开：
+
+```bash
+curl -s -X POST "$BASE/sessions/$SID/questions/$CALL_ID" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"selected":"方案 A"}'
+```
+
 ## 示例：即时插话
 
 ```bash
@@ -182,7 +207,8 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 - **审批裁决只放行一次**：DSH 的 `ApprovalOutcome` 只有 `allowed-once` / `rejected` / `cancelled` / `unavailable`，没有「记住放行」。持久放行请改权限档位。
 - **只裁决本插件持有的审批**：`GET /approvals` 列出的是本插件挂起的项。若审批由界面卡片持有，这里会显示为空，而 `pendingInput` 仍可能有值——两者含义不同。
 - **未裁决的审批 5 分钟后自动撤回**：超时按 `cancelled` 处理并释放回合，避免外部长期不响应把会话卡死。
-- **提问（ask_user_question）尚未开放裁决**：提问与审批共用 waterfall，但选项结构不同，留待后续。
+- **提问裁决要求会话已打开**：与审批不同，提问是通过 `userQuestions.answer()` 直接作答，需要活的 Agent；会话未打开会返回 `NOT_OPEN`。
+- **回答必须覆盖每个问题**：一个问题组里有几项就要给几项（服务会校验），`answers: []` 会被拒绝而不是静默成功。
 
 ## 测试
 

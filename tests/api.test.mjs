@@ -1206,3 +1206,194 @@ test('the approval view never exposes the settle callback', async () => {
   })
   assert.equal(await pending.outcome, 'rejected')
 })
+
+/* ------------------------------------------------------------------ *
+ * Questions (ask_user_question)
+ *
+ * Unlike an approval, a question is answered through a real service method, so
+ * the harness provides a `userQuestions` stub that enforces the same batch
+ * contract the real service does.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A harness whose session waits on one question.
+ * @param options - projection/answer overrides.
+ * @returns the route and recorded calls.
+ */
+function questionHarness(options = {}) {
+  const calls = []
+  const asked = [
+    {
+      callId: 'call-q1',
+      state: 'open',
+      questions: [
+        {
+          id: 'q1',
+          question: '选哪个方案？',
+          header: '方案',
+          options: [{ label: 'A' }, { label: 'B' }],
+        },
+      ],
+    },
+  ]
+  const controller = {
+    async list() { return { items: [] } },
+    async projections() {
+      return { kind: 'sequenced', values: { userQuestions: { active: options.active ?? asked, settled: [] } } }
+    },
+    async state() { return { pendingInput: ['question'], running: true, active: true, queue: [] } },
+  }
+  const userQuestions = {
+    answer(agent, callId, answer) {
+      calls.push(['answer', agent.sessionId, callId, answer])
+      if (options.rejectWith !== undefined) throw options.rejectWith
+      if (options.refuse === true) return false
+      return true
+    },
+  }
+  const agents = { get: (id) => (id === 'session-q' ? { sessionId: 'session-q' } : undefined) }
+  let registered
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) {
+      if (name === 'sessionController') return controller
+      if (name === 'userQuestions') return userQuestions
+      if (name === 'agents') return agents
+      return undefined
+    },
+    on() { return () => {} },
+    effect(fn) { fn() },
+    inject(names, callback) {
+      callback({ effect(fn) { fn() }, webServer: { register(r) { registered = r; return () => {} } } })
+    },
+  }
+  apply(ctx, { token: TOKEN, requireLoopback: true })
+  return { route: registered, calls }
+}
+
+test('GET /sessions/:id/questions lists the waiting question', async () => {
+  const { route } = questionHarness()
+  const answer = await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 200)
+  assert.equal(body.questions.length, 1)
+  assert.equal(body.questions[0].callId, 'call-q1')
+  assert.equal(body.questions[0].kind, 'question')
+  assert.equal(body.questions[0].questions[0].id, 'q1')
+  assert.deepEqual(body.questions[0].questions[0].options, ['A', 'B'])
+})
+
+test('GET questions renders as Markdown', async () => {
+  const { route } = questionHarness()
+  const answer = await call(route, '/session-api/sessions/session-q/questions?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# 待答提问/)
+  assert.match(answer.body, /选哪个方案/)
+})
+
+test('POST answers reaches the service with the batch contract', async () => {
+  const { route, calls } = questionHarness()
+  const answer = await call(route, '/session-api/sessions/session-q/questions/call-q1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 200)
+  assert.equal(body.ok, true)
+  assert.equal(body.answered, 1)
+  const recorded = calls.find(c => c[0] === 'answer')
+  assert.equal(recorded[2], 'call-q1')
+  assert.deepEqual(recorded[3].answers, [{ id: 'q1', selected: ['A'] }])
+})
+
+test('a bare selected value is expanded against the projection', async () => {
+  const { route, calls } = questionHarness()
+  const answer = await call(route, '/session-api/sessions/session-q/questions/call-q1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { selected: 'B' },
+  })
+  assert.equal(answer.status, 200)
+  const recorded = calls.find(c => c[0] === 'answer')
+  assert.deepEqual(recorded[3].answers, [{ id: 'q1', selected: ['B'] }])
+})
+
+test('an unknown callId is 404', async () => {
+  const { route } = questionHarness({ refuse: true })
+  const answer = await call(route, '/session-api/sessions/session-q/questions/call-missing', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(answer.status, 404)
+  assert.equal(JSON.parse(answer.body).code, 'QUESTION_NOT_FOUND')
+})
+
+test('a malformed answer shape is refused before the service', async () => {
+  const { route, calls } = questionHarness()
+  const answer = await call(route, '/session-api/sessions/session-q/questions/call-q1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ selected: ['A'] }] },
+  })
+  assert.equal(answer.status, 409)
+  assert.equal(JSON.parse(answer.body).code, 'BAD_ANSWERS')
+  assert.equal(calls.filter(c => c[0] === 'answer').length, 0)
+})
+
+test('a service rejection is reported with its own message', async () => {
+  const { route } = questionHarness({ rejectWith: new Error('must name each of its 1 questions exactly once') })
+  const answer = await call(route, '/session-api/sessions/session-q/questions/call-q1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(answer.status, 409)
+  const body = JSON.parse(answer.body)
+  assert.equal(body.code, 'ANSWER_REJECTED')
+  assert.match(body.message, /exactly once/)
+})
+
+test('answering a question on a session with no live agent is refused', async () => {
+  const { route } = questionHarness()
+  const answer = await call(route, '/session-api/sessions/session-other/questions/call-q1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(answer.status, 409)
+  assert.equal(JSON.parse(answer.body).code, 'NOT_OPEN')
+})
+
+test('the question endpoints appear in the capability table', async () => {
+  const { route } = questionHarness()
+  const answer = await call(route, '/session-api/capabilities', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  const paths = new Set(body.endpoints.map(e => `${e.method} ${e.path}`))
+  assert.ok(paths.has('GET /sessions/:id/questions'))
+  assert.ok(paths.has('POST /sessions/:id/questions/:callId'))
+  const write = body.endpoints.find(e => e.path === '/sessions/:id/questions/:callId')
+  assert.equal(write.write, true)
+  assert.deepEqual(write.formats, ['json'])
+})
+
+test('an empty answer batch is refused instead of silently succeeding', async () => {
+  const { route, calls } = questionHarness()
+  // [] would answer nothing while reporting success, which reads as a broken
+  // answer to a caller who thought it answered.
+  const answer = await call(route, '/session-api/sessions/session-q/questions/call-q1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [] },
+  })
+  assert.equal(answer.status, 409)
+  assert.equal(JSON.parse(answer.body).code, 'BAD_ANSWERS')
+  assert.equal(calls.filter(c => c[0] === 'answer').length, 0)
+})
