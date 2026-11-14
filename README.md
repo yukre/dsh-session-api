@@ -66,6 +66,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 |---|---|---|
 | GET | `/status` | 服务状态与安全姿态 |
 | GET | `/capabilities` | 接口能力清单（含格式支持） |
+| GET | `/workspaces` | 工作区列表（含 workspaceId，用于新建会话） |
 | GET | `/sessions` | 会话列表 |
 | GET | `/sessions/:id` | 单个会话 |
 | GET | `/sessions/:id/state` | 运行状态、队列、待输入 |
@@ -84,6 +85,48 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | POST | `/sessions/:id/model` | `{provider, model, reasoningEffort?}` | 切模型 |
 | POST | `/sessions/:id/permission` | `{preset}` | 切权限（走与界面相同的命令路径） |
 | DELETE | `/sessions/:id/queue/:itemId` | 无 | 移除排队项 |
+| POST | `/workspaces` | `{path, title?}` | 登记工作区（目录须**已存在**） |
+| POST | `/workspaces/:id/sessions` | `{text, mode?, agentPreset?}` | **在指定工作区新建会话并立即执行首条任务** |
+| POST | `/sessions/create` | `{cwd, text, mode?, agentPreset?}` | 在指定目录（须**已存在**）新建会话并执行首条任务 |
+
+## 示例：在指定工作区新建会话并下达任务
+
+```bash
+# 1. 先看有哪些工作区，拿到 workspaceId
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/workspaces?format=md"
+
+# 2. 在该工作区新建会话，并立即让它开始干活
+curl -s -X POST $BASE/workspaces/$WSID/sessions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"分析这个仓库的依赖风险","mode":"steer"}'
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "accepted": true,
+  "mode": "steer",
+  "sessionId": "session-102ab2d6-...",
+  "cwd": "/Users/you/project",
+  "workspaceId": "c16dd40a-...",
+  "workspacePath": "/Users/you/project",
+  "agentPreset": "standard"
+}
+```
+
+拿这个 `sessionId` 就能继续用 `/sessions/:id/*` 那一套接口操作它。
+
+也可以在任意**已存在**的目录直接开会话，不要求先登记工作区：
+
+```bash
+curl -s -X POST $BASE/sessions/create \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"cwd":"/Users/you/project","text":"先看一下目录结构"}'
+```
 
 ## 示例：即时插话
 
@@ -106,6 +149,8 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 ## 限制
 
 - **仅本机**：设计如此，不提供外网访问
+- **新建会话要求目录已存在**：`cwd` / `path` 必须是**已经存在的目录**，插件不会替你创建。原因：宿主创建会话时会对 `cwd` 执行 `mkdir --recursive`，若不设限，持有 token 的调用方可在磁盘任意位置造目录树。这与界面「添加工作区」的约束一致——工作区只能从已存在的目录登记。
+- **不能指定 sessionId**：会话 ID 由 DSH 生成，接口不提供自定义，避免与「复用已有会话」的语义混淆。
 - **权限切换要求会话已打开**：`/permission` 需要活的 Agent；未打开的会话会返回 `NOT_OPEN`
 - **确认授权暂未开放**（阶段 2）：审批/提问涉及异步 waterfall 生命周期，接入错误会导致审批永久挂起，因此单独实现
 

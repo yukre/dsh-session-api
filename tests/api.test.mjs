@@ -603,3 +603,235 @@ test('conversation limit rejects a non-numeric value instead of truncating', asy
   await request('?limit=10')
   assert.deepEqual(seen, [40, 40, 10])
 })
+
+/* ------------------------------------------------------------------ *
+ * Creating a session in a workspace (new capability)
+ * ------------------------------------------------------------------ */
+
+import { mkdtemp, mkdir, writeFile, rm as frmDir } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
+
+/**
+ * A harness whose controller can create Sessions, plus a real temp directory
+ * so the "existing directory" rule is exercised against the filesystem.
+ * @param overrides - registry stub overrides.
+ * @returns the registered route and the recorded calls.
+ */
+async function createHarness(overrides = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-create-'))
+  const calls = []
+  const workspaces = new Map()
+  workspaces.set('ws-1', { id: 'ws-1', path: root, title: '临时工作区', sessionIds: [] })
+
+  const controller = {
+    async create(request) {
+      calls.push(['create', request.cwd, request.agentPreset])
+      return { sessionId: 'session-new-1', agentPreset: request.agentPreset ?? 'standard' }
+    },
+    async prompt(request) {
+      calls.push(['prompt', request.sessionId, request.mode, request.content[0].text])
+      return { accepted: true }
+    },
+    async list() { return { items: [] } },
+  }
+  const registry = {
+    list: () => [...workspaces.values()],
+    get: (id) => workspaces.get(id),
+    create: async (path, title) => {
+      const id = 'ws-new'
+      const value = { id, path, title: title ?? path, sessionIds: [] }
+      workspaces.set(id, value)
+      calls.push(['registryCreate', path])
+      return value
+    },
+    ...overrides.registry,
+  }
+  let registered
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) {
+      if (name === 'sessionController') return controller
+      if (name === 'workspaceRegistry') return registry
+      return undefined
+    },
+    inject(names, callback) {
+      callback({
+        effect(fn) { fn() },
+        webServer: { register(route) { registered = route; return () => {} } },
+      })
+    },
+  }
+  apply(ctx, { token: TOKEN, requireLoopback: true })
+  return { route: registered, calls, root, workspaces }
+}
+
+const post = (route, path, body) => call(route, path, {
+  method: 'POST',
+  headers: { authorization: `Bearer ${TOKEN}` },
+  body,
+})
+
+test('POST /workspaces/:id/sessions creates a session and runs the first task', async () => {
+  const { route, calls, root } = await createHarness()
+  const answer = await post(route, '/session-api/workspaces/ws-1/sessions', { text: '分析依赖风险' })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 200)
+  assert.equal(body.ok, true)
+  assert.equal(body.sessionId, 'session-new-1')
+  assert.equal(body.accepted, true)
+  assert.equal(body.mode, 'steer')
+  assert.equal(body.workspaceId, 'ws-1')
+  // The route canonicalises the directory, so compare against realpath: on
+  // macOS `/var` is a symlink to `/private/var` and the API reports the target.
+  const { realpath: rp } = await import('node:fs/promises')
+  const canonicalRoot = await rp(root)
+  assert.ok(calls.some(c => c[0] === 'create' && c[1] === canonicalRoot))
+  assert.ok(calls.some(c => c[0] === 'prompt' && c[3] === '分析依赖风险'))
+  await frmDir(root, { recursive: true, force: true })
+})
+
+test('POST /sessions/create honours mode=queue', async () => {
+  const { route, calls, root } = await createHarness()
+  const answer = await post(route, '/session-api/sessions/create', { cwd: root, text: 'later', mode: 'queue' })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 200)
+  assert.equal(body.mode, 'queue')
+  assert.ok(calls.some(c => c[0] === 'prompt' && c[2] === 'queue'))
+  await frmDir(root, { recursive: true, force: true })
+})
+
+test('a missing cwd is refused without touching the filesystem', async () => {
+  const { route } = await createHarness()
+  const answer = await post(route, '/session-api/sessions/create', { text: 'x' })
+  assert.equal(answer.status, 400)
+  assert.equal(JSON.parse(answer.body).code, 'BAD_CWD')
+})
+
+test('a relative cwd is refused', async () => {
+  const { route } = await createHarness()
+  const answer = await post(route, '/session-api/sessions/create', { cwd: 'relative/path', text: 'x' })
+  assert.equal(answer.status, 400)
+  assert.equal(JSON.parse(answer.body).code, 'BAD_CWD')
+})
+
+test('a non-existent cwd is refused and never created', async () => {
+  const { route } = await createHarness()
+  const missing = join(tmpdir(), `dsa-absent-${Date.now()}`)
+  const answer = await post(route, '/session-api/sessions/create', { cwd: missing, text: 'x' })
+  assert.equal(answer.status, 404)
+  assert.equal(JSON.parse(answer.body).code, 'CWD_NOT_FOUND')
+  // The decisive assertion: the Host would mkdir() this path, so the API must
+  // refuse before that happens and leave nothing behind.
+  const { existsSync } = await import('node:fs')
+  assert.equal(existsSync(missing), false)
+})
+
+test('a cwd that is a file is refused', async () => {
+  const { route, root } = await createHarness()
+  const filePath = join(root, 'a-file.txt')
+  await writeFile(filePath, 'x')
+  const answer = await post(route, '/session-api/sessions/create', { cwd: filePath, text: 'x' })
+  assert.equal(answer.status, 400)
+  assert.equal(JSON.parse(answer.body).code, 'CWD_NOT_DIRECTORY')
+  await frmDir(root, { recursive: true, force: true })
+})
+
+test('a missing text is refused before creating anything', async () => {
+  const { route, calls, root } = await createHarness()
+  const before = calls.filter(c => c[0] === 'create').length
+  const answer = await post(route, '/session-api/sessions/create', { cwd: root, text: '   ' })
+  assert.equal(answer.status, 400)
+  assert.equal(JSON.parse(answer.body).code, 'BAD_TEXT')
+  assert.equal(calls.filter(c => c[0] === 'create').length, before)
+  await frmDir(root, { recursive: true, force: true })
+})
+
+test('an unknown workspace is 404', async () => {
+  const { route } = await createHarness()
+  const answer = await post(route, '/session-api/workspaces/ws-missing/sessions', { text: 'x' })
+  assert.equal(answer.status, 404)
+  assert.equal(JSON.parse(answer.body).code, 'WORKSPACE_NOT_FOUND')
+})
+
+test('a failed first task reports the created session id', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsa-promptfail-'))
+  const controller = {
+    async create() { return { sessionId: 'session-half' } },
+    async prompt() { throw new Error('inbox closed') },
+    async list() { return { items: [] } },
+  }
+  let registered
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) {
+      if (name === 'sessionController') return controller
+      if (name === 'workspaceRegistry') return { list: () => [], get: () => undefined }
+      return undefined
+    },
+    inject(names, callback) {
+      callback({ effect(fn) { fn() }, webServer: { register(r) { registered = r; return () => {} } } })
+    },
+  }
+  apply(ctx, { token: TOKEN, requireLoopback: true })
+  const answer = await post(registered, '/session-api/sessions/create', { cwd: root, text: 'x' })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 502)
+  assert.equal(body.ok, false)
+  assert.equal(body.code, 'PROMPT_FAILED')
+  // The Session is durable, so its id must survive the failure report.
+  assert.equal(body.sessionId, 'session-half')
+  await frmDir(root, { recursive: true, force: true })
+})
+
+test('POST /workspaces adopts an existing directory', async () => {
+  const { route, calls } = await createHarness()
+  const dir = await mkdtemp(join(tmpdir(), 'dsa-adopt-'))
+  const answer = await post(route, '/session-api/workspaces', { path: dir })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 200)
+  assert.equal(body.ok, true)
+  assert.ok(calls.some(c => c[0] === 'registryCreate'))
+  await frmDir(dir, { recursive: true, force: true })
+})
+
+test('POST /workspaces refuses a missing directory', async () => {
+  const { route } = await createHarness()
+  const missing = join(tmpdir(), `dsa-nodir-${Date.now()}`)
+  const answer = await post(route, '/session-api/workspaces', { path: missing })
+  assert.equal(answer.status, 404)
+  assert.equal(JSON.parse(answer.body).code, 'CWD_NOT_FOUND')
+})
+
+test('GET /workspaces lists workspaces in both formats', async () => {
+  const { route, root } = await createHarness()
+  const json = await call(route, '/session-api/workspaces', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(json.status, 200)
+  assert.equal(JSON.parse(json.body).workspaces.length, 1)
+
+  const md = await call(route, '/session-api/workspaces?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(md.status, 200)
+  assert.match(md.body, /^# 工作区/)
+  await frmDir(root, { recursive: true, force: true })
+})
+
+test('the new endpoints appear in the capability table', async () => {
+  const { route } = await createHarness()
+  const answer = await call(route, '/session-api/capabilities', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  const paths = new Set(body.endpoints.map(e => `${e.method} ${e.path}`))
+  assert.ok(paths.has('GET /workspaces'))
+  assert.ok(paths.has('POST /workspaces'))
+  assert.ok(paths.has('POST /workspaces/:id/sessions'))
+  assert.ok(paths.has('POST /sessions/create'))
+  // Reads may offer Markdown; the three writes must not claim it.
+  for (const entry of body.endpoints) {
+    if (entry.write === true) assert.deepEqual(entry.formats, ['json'])
+  }
+})
