@@ -1,0 +1,15 @@
+# dsh-session-api bundle patch: inserts the Host row into the profile's roster.
+# The bundle patch is applied automatically on install, so do NOT insert this
+# row again in the profile patch (duplicate ids crash the loader).
+#
+# Settings:
+#   token         shared secret every request must present; leave empty to mint
+#                 one at <DSH home>/session-api/token on first start
+#   tokenFile     read the secret from this file instead of `token`
+#   requireLoopback  refuse a request whose socket peer is not loopback
+- insert:
+    - id: dsh-session-api
+      name: 'dsh-session-api'
+      config:
+        token: ''
+        requireLoopback: true

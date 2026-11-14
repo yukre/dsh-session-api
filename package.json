@@ -1,0 +1,45 @@
+{
+  "name": "dsh-session-api",
+  "version": "1.0.0",
+  "description": "Local HTTP control surface for DeepSeek Harness sessions: read run state and drive prompt, model, permission, queue and cancel from outside the page.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/api.test.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "api",
+    "automation",
+    "remote-control"
+  ],
+  "author": "yukre",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yukre/dsh-session-api.git"
+  },
+  "homepage": "https://github.com/yukre/dsh-session-api#readme",
+  "bugs": {
+    "url": "https://github.com/yukre/dsh-session-api/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
