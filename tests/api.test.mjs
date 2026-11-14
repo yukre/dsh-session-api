@@ -1397,3 +1397,71 @@ test('an empty answer batch is refused instead of silently succeeding', async ()
   assert.equal(JSON.parse(answer.body).code, 'BAD_ANSWERS')
   assert.equal(calls.filter(c => c[0] === 'answer').length, 0)
 })
+
+/* ------------------------------------------------------------------ *
+ * Renderers must match the REAL payload shapes
+ *
+ * Every one of these was written from a guessed field name once and silently
+ * produced an em-dash column. They are asserted against the shapes the live
+ * controllers actually return.
+ * ------------------------------------------------------------------ */
+
+import { renderModelCatalog, renderQueue, renderSessionDetail } from '../lib/markdown.js'
+
+test('model catalog renders reasoning efforts from `reasoning.efforts`', () => {
+  const catalog = {
+    default: 'deepseek-flash',
+    groups: [{
+      id: 'acct',
+      name: 'Account',
+      models: [{ id: 'deepseek-flash', name: 'Flash', reasoning: { efforts: [{ id: 'off' }, { id: 'low' }, { id: 'high' }] } }],
+    }],
+    failures: [{ provider: 'broken', reason: 'no key' }],
+  }
+  const md = renderModelCatalog(catalog)
+  assert.match(md, /默认模型：`deepseek-flash`/)
+  assert.match(md, /## Account/)
+  assert.match(md, /off, low, high/)
+  assert.match(md, /不可用的提供方/)
+  assert.match(md, /broken/)
+  // A model without reasoning must not print an empty cell as if data were missing.
+  const plain = renderModelCatalog({ groups: [{ id: 'p', models: [{ id: 'm', name: 'M' }] }] })
+  assert.match(plain, /无/)
+})
+
+test('queue renders id, placement and text from content blocks', () => {
+  const queue = [
+    { id: 'msg-1', placement: 'queued', content: [{ type: 'text', text: '先分析依赖' }] },
+    { id: 'msg-2', placement: 'steering', content: [{ type: 'image', data: 'x' }] },
+  ]
+  const md = renderQueue('session-q', queue)
+  assert.match(md, /`msg-1`/)
+  assert.match(md, /queued/)
+  assert.match(md, /先分析依赖/)
+  assert.match(md, /steering/)
+  assert.match(md, /1 个非文本块/)
+})
+
+test('session detail reads title, model and usage from projections.values', () => {
+  const session = {
+    sessionId: 'session-z',
+    running: true,
+    cwd: '/tmp',
+    projections: {
+      kind: 'sequenced',
+      values: {
+        title: '真实标题',
+        modelSelection: { lastUsed: { provider: 'p', model: 'm' } },
+        agentPreset: 'cordis',
+        tokenUsage: { uncachedInputTokens: 1500, outputTokens: 200, cacheReadTokens: 0 },
+        permissions: { currentValue: 'workspace-write' },
+      },
+    },
+  }
+  const md = renderSessionDetail(session, { running: true, active: true, queue: [], pendingInput: [] })
+  assert.match(md, /# 真实标题/)
+  assert.match(md, /p \/ m/)
+  assert.match(md, /cordis/)
+  assert.match(md, /1\.5k/)
+  assert.match(md, /workspace-write/)
+})
