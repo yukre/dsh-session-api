@@ -1105,3 +1105,104 @@ test('the approval endpoints appear in the capability table', async () => {
   assert.equal(decision.write, true)
   assert.deepEqual(decision.formats, ['json'])
 })
+
+/* ------------------------------------------------------------------ *
+ * Regressions found by self-audit
+ * ------------------------------------------------------------------ */
+
+test('an already-aborted request resolves cancelled without parking an entry', async () => {
+  const { route, fire } = approvalHarness()
+  const controller = new AbortController()
+  controller.abort()
+  // This used to throw: `settle` referenced `timer` before it was declared.
+  const outcome = await fire('session-h', { signal: controller.signal }).outcome
+  assert.equal(outcome, 'cancelled')
+  // And nothing may be left behind that no caller can decide.
+  const listed = await call(route, '/session-api/sessions/session-h/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(JSON.parse(listed.body).pending.length, 0)
+})
+
+test('concurrent approvals stay independent', async () => {
+  const { route, fire } = approvalHarness()
+  const first = fire('session-i', { toolName: 'bash', callId: 'c1' })
+  const second = fire('session-i', { toolName: 'write', callId: 'c2' })
+  await new Promise(r => setTimeout(r, 0))
+
+  const listed = await call(route, '/session-api/sessions/session-i/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const pending = JSON.parse(listed.body).pending
+  assert.equal(pending.length, 2)
+
+  // Decide only the write one; the bash one must stay pending.
+  const writeEntry = pending.find(p => p.toolName === 'write')
+  await call(route, `/session-api/sessions/session-i/approvals/${writeEntry.decisionId}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'allow' },
+  })
+  assert.equal(await second.outcome, 'allowed-once')
+  // Still queued, so the other session's decision has not been applied.
+  const after = await call(route, '/session-api/sessions/session-i/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const remaining = JSON.parse(after.body).pending
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0].toolName, 'bash')
+
+  await call(route, `/session-api/sessions/session-i/approvals/${remaining[0].decisionId}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(await first.outcome, 'rejected')
+})
+
+test('a held approval is released when the plugin unloads', async () => {
+  const cleanups = []
+  let listener
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) { return name === 'sessionController' ? { async list() { return { items: [] } } } : undefined },
+    on(event, fn) { listener = fn; return () => {} },
+    effect(fn) {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+      return cleanup
+    },
+    inject(names, callback) {
+      callback({ effect(fn) { fn() }, webServer: { register() { return () => {} } } })
+    },
+  }
+  apply(ctx, { token: TOKEN, requireLoopback: true })
+  const pending = listener({ agent: { sessionId: 'session-j' }, toolName: 'bash' }, () => Promise.resolve('unavailable'))
+  await new Promise(r => setTimeout(r, 0))
+
+  // Unloading the plugin must not strand the turn: the promise has to settle.
+  for (const cleanup of cleanups) cleanup()
+  const outcome = await Promise.race([pending, new Promise(r => setTimeout(() => r('__HUNG__'), 300))])
+  assert.equal(outcome, 'cancelled')
+})
+
+test('the approval view never exposes the settle callback', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-k')
+  await new Promise(r => setTimeout(r, 0))
+  const listed = await call(route, '/session-api/sessions/session-k/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const entry = JSON.parse(listed.body).pending[0]
+  assert.equal(entry.settle, undefined)
+  assert.equal(entry.sessionId, undefined)
+  // Only the documented fields travel.
+  assert.deepEqual(Object.keys(entry).sort(), ['askedAt', 'callId', 'decisionId', 'kind', 'reason', 'toolName'])
+
+  await call(route, `/session-api/sessions/session-k/approvals/${entry.decisionId}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(await pending.outcome, 'rejected')
+})
