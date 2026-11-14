@@ -67,6 +67,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | GET | `/status` | 服务状态与安全姿态 |
 | GET | `/capabilities` | 接口能力清单（含格式支持） |
 | GET | `/workspaces` | 工作区列表（含 workspaceId，用于新建会话） |
+| GET | `/sessions/:id/approvals` | 列出本插件持有的待决审批 |
 | GET | `/sessions` | 会话列表 |
 | GET | `/sessions/:id` | 单个会话 |
 | GET | `/sessions/:id/state` | 运行状态、队列、待输入 |
@@ -88,6 +89,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | POST | `/workspaces` | `{path, title?}` | 登记工作区（目录须**已存在**） |
 | POST | `/workspaces/:id/sessions` | `{text, mode?, agentPreset?}` | **在指定工作区新建会话并立即执行首条任务** |
 | POST | `/sessions/create` | `{cwd, text, mode?, agentPreset?}` | 在指定目录（须**已存在**）新建会话并执行首条任务 |
+| POST | `/sessions/:id/approvals/:decisionId` | `{decision: "allow"\|"deny"}` | 裁决一条待决审批（仅本次生效） |
 
 ## 示例：在指定工作区新建会话并下达任务
 
@@ -128,6 +130,31 @@ curl -s -X POST $BASE/sessions/create \
   -d '{"cwd":"/Users/you/project","text":"先看一下目录结构"}'
 ```
 
+## 示例：跨会话裁决挂起的审批
+
+当某个会话卡在审批卡片上（Auto review 拦截了命令），可以从外部放行：
+
+```bash
+# 1. 看有哪些待决审批
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/sessions/$SID/approvals?format=md"
+
+# 2. 放行其中一条（或 deny 拒绝）
+curl -s -X POST "$BASE/sessions/$SID/approvals/$DECISION_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"decision":"allow"}'
+```
+
+返回：
+
+```json
+{ "ok": true, "decisionId": "3f2a…", "decision": "allow", "applied": "allowed-once" }
+```
+
+裁决后该会话立即继续运行，`pendingInput` 随之清空。
+
+> **只影响这一条审批**。DSH 的审批结果只有「单次放行 / 拒绝」两种，没有「以后都放行」。若要让某类命令以后不再询问，请用 `POST /sessions/:id/permission` 切换权限档位——那才是 DSH 提供的持久机制。
+
 ## 示例：即时插话
 
 ```bash
@@ -152,7 +179,10 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 - **新建会话要求目录已存在**：`cwd` / `path` 必须是**已经存在的目录**，插件不会替你创建。原因：宿主创建会话时会对 `cwd` 执行 `mkdir --recursive`，若不设限，持有 token 的调用方可在磁盘任意位置造目录树。这与界面「添加工作区」的约束一致——工作区只能从已存在的目录登记。
 - **不能指定 sessionId**：会话 ID 由 DSH 生成，接口不提供自定义，避免与「复用已有会话」的语义混淆。
 - **权限切换要求会话已打开**：`/permission` 需要活的 Agent；未打开的会话会返回 `NOT_OPEN`
-- **确认授权暂未开放**（阶段 2）：审批/提问涉及异步 waterfall 生命周期，接入错误会导致审批永久挂起，因此单独实现
+- **审批裁决只放行一次**：DSH 的 `ApprovalOutcome` 只有 `allowed-once` / `rejected` / `cancelled` / `unavailable`，没有「记住放行」。持久放行请改权限档位。
+- **只裁决本插件持有的审批**：`GET /approvals` 列出的是本插件挂起的项。若审批由界面卡片持有，这里会显示为空，而 `pendingInput` 仍可能有值——两者含义不同。
+- **未裁决的审批 5 分钟后自动撤回**：超时按 `cancelled` 处理并释放回合，避免外部长期不响应把会话卡死。
+- **提问（ask_user_question）尚未开放裁决**：提问与审批共用 waterfall，但选项结构不同，留待后续。
 
 ## 测试
 

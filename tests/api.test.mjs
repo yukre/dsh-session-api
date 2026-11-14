@@ -835,3 +835,273 @@ test('the new endpoints appear in the capability table', async () => {
     if (entry.write === true) assert.deepEqual(entry.formats, ['json'])
   }
 })
+
+/* ------------------------------------------------------------------ *
+ * Approval decisions
+ *
+ * These drive the REAL waterfall: the harness registers the plugin's answerer
+ * on a stub context, then fires an `approval/request` exactly as the Host does
+ * and inspects the outcome the plugin resolves. That is the only contract that
+ * matters — an answer that never settles would block a turn forever.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A harness whose context can emit `approval/request` like the Host does.
+ * @returns the route plus a way to fire one approval.
+ */
+function approvalHarness() {
+  const listeners = []
+  const calls = []
+  const controller = {
+    async list() { return { items: [] } },
+    async state(request) {
+      calls.push(['state', request.sessionId])
+      return { pendingInput: ['approval'], running: true, active: true, queue: [] }
+    },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) { return name === 'sessionController' ? controller : undefined },
+    on(event, listener) {
+      if (event === 'approval/request') listeners.push(listener)
+      return () => {}
+    },
+    effect(fn) { fn() },
+    inject(names, callback) {
+      callback({
+        effect(fn) { fn() },
+        webServer: { register(route) { this._route = route; return () => {} } },
+      })
+    },
+  }
+  // Capture the registered route.
+  let registered
+  ctx.inject = (names, callback) => callback({
+    effect(fn) { fn() },
+    webServer: { register(r) { registered = r; return () => {} } },
+  })
+  apply(ctx, { token: TOKEN, requireLoopback: true })
+
+  /**
+   * Fire one approval as the Host would.
+   * @param sessionId - the asking agent's session.
+   * @param overrides - field overrides.
+   * @returns a promise of the outcome plus the request signal.
+   */
+  const fire = (sessionId, overrides = {}) => {
+    const request = {
+      agent: { sessionId },
+      toolName: 'bash',
+      callId: 'call-1',
+      reason: '需要执行只读命令',
+      ...overrides,
+    }
+    const outcome = listeners[0](request, () => Promise.resolve('unavailable'))
+    return { outcome, request }
+  }
+  return { route: registered, fire, calls, listenerCount: () => listeners.length }
+}
+
+test('the plugin registers exactly one approval answerer', () => {
+  const { listenerCount } = approvalHarness()
+  assert.equal(listenerCount(), 1)
+})
+
+test('an approval is listed while it waits', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-a')
+  // Give the listener a tick to park the entry.
+  await new Promise(r => setTimeout(r, 0))
+  const answer = await call(route, '/session-api/sessions/session-a/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  assert.equal(answer.status, 200)
+  assert.equal(body.pending.length, 1)
+  assert.equal(body.pending[0].toolName, 'bash')
+  assert.equal(body.pending[0].reason, '需要执行只读命令')
+  assert.equal(body.pending[0].sessionId, undefined)
+  assert.ok(typeof body.pending[0].decisionId === 'string')
+  // Leave nothing pending for the next test.
+  await call(route, `/session-api/sessions/session-a/approvals/${body.pending[0].decisionId}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(await pending.outcome, 'rejected')
+})
+
+test('allow resolves the waterfall with allowed-once and clears the queue', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-b')
+  await new Promise(r => setTimeout(r, 0))
+  const listed = await call(route, '/session-api/sessions/session-b/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const id = JSON.parse(listed.body).pending[0].decisionId
+  const decided = await call(route, `/session-api/sessions/session-b/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'allow' },
+  })
+  const body = JSON.parse(decided.body)
+  assert.equal(decided.status, 200)
+  assert.equal(body.applied, 'allowed-once')
+  // The decisive assertion: the Host's await settles, so the turn unblocks.
+  assert.equal(await pending.outcome, 'allowed-once')
+  // And the queue no longer holds it.
+  const after = await call(route, '/session-api/sessions/session-b/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(JSON.parse(after.body).pending.length, 0)
+})
+
+test('deny resolves with rejected', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-c')
+  await new Promise(r => setTimeout(r, 0))
+  const listed = await call(route, '/session-api/sessions/session-c/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const id = JSON.parse(listed.body).pending[0].decisionId
+  const decided = await call(route, `/session-api/sessions/session-c/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(JSON.parse(decided.body).applied, 'rejected')
+  assert.equal(await pending.outcome, 'rejected')
+})
+
+test('an unknown decision id is 404', async () => {
+  const { route } = approvalHarness()
+  const answer = await call(route, '/session-api/sessions/session-a/approvals/deadbeef', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'allow' },
+  })
+  assert.equal(answer.status, 404)
+  assert.equal(JSON.parse(answer.body).code, 'APPROVAL_NOT_FOUND')
+})
+
+test('deciding the same approval twice is 404 the second time', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-d')
+  await new Promise(r => setTimeout(r, 0))
+  const listed = await call(route, '/session-api/sessions/session-d/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const id = JSON.parse(listed.body).pending[0].decisionId
+  const first = await call(route, `/session-api/sessions/session-d/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'allow' },
+  })
+  assert.equal(first.status, 200)
+  const second = await call(route, `/session-api/sessions/session-d/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(second.status, 404)
+  // The first decision stands.
+  assert.equal(await pending.outcome, 'allowed-once')
+})
+
+test('an approval cannot be decided through another session id', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-real')
+  await new Promise(r => setTimeout(r, 0))
+  const listed = await call(route, '/session-api/sessions/session-real/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const id = JSON.parse(listed.body).pending[0].decisionId
+  const wrongSession = await call(route, `/session-api/sessions/session-other/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'allow' },
+  })
+  assert.equal(wrongSession.status, 404)
+  // Still pending, so the real session can still decide it.
+  const right = await call(route, `/session-api/sessions/session-real/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'allow' },
+  })
+  assert.equal(right.status, 200)
+  assert.equal(await pending.outcome, 'allowed-once')
+})
+
+test('an invalid decision value is refused and leaves the approval pending', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-e')
+  await new Promise(r => setTimeout(r, 0))
+  const listed = await call(route, '/session-api/sessions/session-e/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const id = JSON.parse(listed.body).pending[0].decisionId
+  const bad = await call(route, `/session-api/sessions/session-e/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'maybe' },
+  })
+  assert.equal(bad.status, 400)
+  assert.equal(JSON.parse(bad.body).code, 'BAD_DECISION')
+  // The approval must survive a rejected request.
+  const listedAgain = await call(route, '/session-api/sessions/session-e/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(JSON.parse(listedAgain.body).pending.length, 1)
+  await call(route, `/session-api/sessions/session-e/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(await pending.outcome, 'rejected')
+})
+
+test('an aborted approval resolves cancelled so the turn is released', async () => {
+  const { fire } = approvalHarness()
+  const controller = new AbortController()
+  const pending = fire('session-f', { signal: controller.signal })
+  await new Promise(r => setTimeout(r, 0))
+  controller.abort()
+  assert.equal(await pending.outcome, 'cancelled')
+})
+
+test('approvals render as Markdown', async () => {
+  const { route, fire } = approvalHarness()
+  const pending = fire('session-g')
+  await new Promise(r => setTimeout(r, 0))
+  const answer = await call(route, '/session-api/sessions/session-g/approvals?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# 待决审批/)
+  assert.match(answer.body, /bash/)
+  const listed = await call(route, '/session-api/sessions/session-g/approvals', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const id = JSON.parse(listed.body).pending[0].decisionId
+  await call(route, `/session-api/sessions/session-g/approvals/${id}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { decision: 'deny' },
+  })
+  assert.equal(await pending.outcome, 'rejected')
+})
+
+test('the approval endpoints appear in the capability table', async () => {
+  const { route } = approvalHarness()
+  const answer = await call(route, '/session-api/capabilities', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  const paths = new Set(body.endpoints.map(e => `${e.method} ${e.path}`))
+  assert.ok(paths.has('GET /sessions/:id/approvals'))
+  assert.ok(paths.has('POST /sessions/:id/approvals/:decisionId'))
+  // The decision is a write and must not claim a Markdown form.
+  const decision = body.endpoints.find(e => e.path === '/sessions/:id/approvals/:decisionId')
+  assert.equal(decision.write, true)
+  assert.deepEqual(decision.formats, ['json'])
+})
