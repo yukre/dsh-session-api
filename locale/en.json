@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Session API",
+    "title": "Session remote control",
     "description": "A loopback HTTP control surface for sessions: read run state and drive prompt, model, permission, queue and cancel from outside the page."
   }
 }

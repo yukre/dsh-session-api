@@ -461,3 +461,85 @@ test('path normalisation cannot escape the plugin prefix', () => {
   // check, rather than silently splitting into two segments.
   assert.deepEqual(segmentsOf('/session-api/sessions/..%2Fetc/state'), ['sessions', '../etc', 'state'])
 })
+
+/* ------------------------------------------------------------------ *
+ * Markdown presentation + capability table
+ * ------------------------------------------------------------------ */
+
+test('GET capabilities lists every endpoint with its formats', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/capabilities', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  const body = JSON.parse(answer.body)
+  assert.equal(body.ok, true)
+  assert.deepEqual(body.formats, ['json', 'md'])
+  assert.ok(Array.isArray(body.endpoints))
+  assert.ok(body.endpoints.length >= 14)
+
+  // Every Markdown-capable read must be declared, and no write may claim md.
+  const mdReads = body.endpoints.filter(e => e.formats.includes('md'))
+  for (const entry of mdReads) assert.equal(entry.write, false)
+  const writes = body.endpoints.filter(e => e.write === true)
+  for (const entry of writes) assert.deepEqual(entry.formats, ['json'])
+  // The conversation endpoint is the point of the feature.
+  assert.ok(body.endpoints.some(e => e.path === '/sessions/:id/conversation'))
+})
+
+test('GET sessions with format=md returns a Markdown table', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/sessions?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# 会话列表/)
+  assert.match(answer.body, /\| 状态 \| 标题 \|/)
+  assert.match(answer.body, /session-a/)
+})
+
+test('GET capabilities with format=md renders the table', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/capabilities?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# 接口能力清单/)
+  assert.match(answer.body, /JSON \/ Markdown/)
+})
+
+test('GET models with format=md renders the catalog', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/models?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# 可选模型/)
+})
+
+test('GET permissions with format=md renders presets', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/permissions?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# 权限预设/)
+})
+
+test('GET one session with format=md renders detail', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/sessions/session-a?format=md', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.match(answer.body, /^# /)
+  assert.match(answer.body, /会话 ID/)
+})
+
+test('JSON stays the default when format is absent', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/sessions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.ok(answer.body.startsWith('{'))
+})

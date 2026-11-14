@@ -36,6 +36,28 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/status
 curl -s -H "Authorization: Bearer $TOKEN" $BASE/sessions
 ```
 
+## 输出格式：JSON 或 Markdown
+
+所有**只读**接口都支持 `?format=md` 返回 Markdown 文本（表格、标题、列表），方便直接阅读或塞进聊天窗口。
+
+```bash
+# JSON（默认）
+curl -s -H "Authorization: Bearer $TOKEN" $BASE/sessions
+
+# Markdown
+curl -s -H "Authorization: Bearer $TOKEN" "$BASE/sessions?format=md"
+```
+
+**哪些接口支持 Markdown，由接口自己公布**——不用猜：
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
+```
+
+它返回每个接口的 `method` / `path` / `formats` / `write` / `summary`，调用方看一眼就知道该用哪种格式。
+
+> 写入接口只返回 JSON：回执渲染成散文没有意义。
+
 ## 接口清单
 
 ### 只读
@@ -43,9 +65,12 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/sessions
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/status` | 服务状态与安全姿态 |
+| GET | `/capabilities` | 接口能力清单（含格式支持） |
 | GET | `/sessions` | 会话列表 |
 | GET | `/sessions/:id` | 单个会话 |
 | GET | `/sessions/:id/state` | 运行状态、队列、待输入 |
+| GET | `/sessions/:id/queue` | 排队消息列表 |
+| GET | `/sessions/:id/conversation` | 对话内容（`?limit=N`，默认 40，上限 200） |
 | GET | `/sessions/:id/projections` | 投影数据 |
 | GET | `/models` | 可选模型目录 |
 | GET | `/permissions` | 权限预设与当前值 |
@@ -90,7 +115,7 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 node --test tests/api.test.mjs
 ```
 
-24 项断言，覆盖三层安全门、全部路由、输入校验与错误路径。
+32 项断言，覆盖三层安全门、全部路由、输入校验与错误路径。
 
 ## 许可
 
