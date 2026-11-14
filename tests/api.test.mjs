@@ -543,3 +543,63 @@ test('JSON stays the default when format is absent', async () => {
   })
   assert.ok(answer.body.startsWith('{'))
 })
+
+/* ------------------------------------------------------------------ *
+ * Audit follow-ups: strict routing and parsing
+ * ------------------------------------------------------------------ */
+
+test('settings routes reject extra path segments', async () => {
+  const { route } = harness()
+  // /settings/token/extra must not be treated as /settings/token. It falls
+  // through to the catch-all 404 rather than reaching the settings branch.
+  const answer = await call(route, '/session-api/settings/token/extra', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 404)
+  assert.equal(JSON.parse(answer.body).code, 'NO_ROUTE')
+})
+
+test('conversation limit rejects a non-numeric value instead of truncating', async () => {
+  // The controller stub records the maxMessages it receives, so a malformed
+  // limit must fall back to the documented default rather than becoming 10.
+  const seen = []
+  const controller = {
+    async list() { return { items: [{ sessionId: 'session-a' }] } },
+    async page(request) { seen.push(request.maxMessages); return { records: [] } },
+  }
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) { return name === 'sessionController' ? controller : undefined },
+    inject(names, callback) {
+      callback({
+        effect(fn) { fn() },
+        webServer: { register(route) { this._route = route; return () => {} } },
+      })
+    },
+  }
+  // Capture the registered route through a fresh harness-shaped context.
+  let registered
+  ctx.inject = (names, callback) => callback({
+    effect(fn) { fn() },
+    webServer: { register(r) { registered = r; return () => {} } },
+  })
+  apply(ctx, { token: TOKEN, requireLoopback: true })
+
+  const request = async (query) => {
+    let settle
+    const done = new Promise(resolve => { settle = resolve })
+    const req = Readable.from([])
+    req.method = 'GET'
+    req.url = `/session-api/sessions/session-a/conversation${query}`
+    req.headers = { authorization: `Bearer ${TOKEN}` }
+    req.socket = { remoteAddress: '127.0.0.1' }
+    const res = { statusCode: 200, setHeader() {}, end(t) { settle(t ?? '') } }
+    await registered.handler(req, res)
+    return done
+  }
+
+  await request('?limit=abc')
+  await request('?limit=10abc')
+  await request('?limit=10')
+  assert.deepEqual(seen, [40, 40, 10])
+})
