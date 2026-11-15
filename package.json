@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-api",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Local HTTP control surface for DeepSeek Harness sessions: read run state and drive prompt, model, permission, queue and cancel from outside the page.",
   "type": "module",
   "main": "lib/index.js",

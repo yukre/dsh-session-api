@@ -1465,3 +1465,38 @@ test('session detail reads title, model and usage from projections.values', () =
   assert.match(md, /1\.5k/)
   assert.match(md, /workspace-write/)
 })
+
+/* ------------------------------------------------------------------ *
+ * Malformed bodies must be client errors, not server faults
+ * ------------------------------------------------------------------ */
+
+test('a non-object JSON body is 400, never a 500', async () => {
+  const { route } = harness()
+  // `JSON.parse('null')` succeeds, so `body.text` would throw a TypeError and be
+  // reported as a server fault. Each of these must be refused as a bad request.
+  for (const raw of ['null', '[]', '123', '"text"', 'true']) {
+    const req = Readable.from([Buffer.from(raw)])
+    req.method = 'POST'
+    req.url = '/session-api/sessions/session-a/prompt'
+    req.headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }
+    req.socket = { remoteAddress: '127.0.0.1' }
+    let settle
+    const done = new Promise(resolve => { settle = resolve })
+    const res = { statusCode: 200, setHeader() {}, end(t) { settle({ status: this.statusCode, body: t ?? '' }) } }
+    await route.handler(req, res)
+    const answer = await done
+    assert.equal(answer.status, 400, `body ${raw} should be a bad request`)
+    assert.equal(JSON.parse(answer.body).code, 'BAD_JSON')
+  }
+})
+
+test('an array body is refused for the same reason', async () => {
+  const { route } = harness()
+  const answer = await call(route, '/session-api/sessions/session-a/model', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: [{ provider: 'p', model: 'm' }],
+  })
+  assert.equal(answer.status, 400)
+  assert.equal(JSON.parse(answer.body).code, 'BAD_JSON')
+})
