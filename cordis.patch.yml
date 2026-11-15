@@ -2,14 +2,22 @@
 # The bundle patch is applied automatically on install, so do NOT insert this
 # row again in the profile patch (duplicate ids crash the loader).
 #
-# Settings:
+# The bundled skill (skills/dsh-session-status) is synced into the skill library
+# by the plugin itself on activation — see lib/skills-sync.js. It is NOT mounted
+# through `skill-filesystem` here: the web-app layer disables the host
+# `skill-filesystem` row on purpose (presets own local discovery), so a host
+# layer override would be inert.
+#
+# Settings of the plugin row:
 #   token         shared secret every request must present; leave empty to mint
 #                 one at <DSH home>/session-api/token on first start
 #   tokenFile     read the secret from this file instead of `token`
 #   requireLoopback  refuse a request whose socket peer is not loopback
+#   syncSkills    copy the bundled skill into the skill library on activation
 - insert:
     - id: dsh-session-api
       name: 'dsh-session-api'
       config:
         token: ''
         requireLoopback: true
+        syncSkills: true

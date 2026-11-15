@@ -36,6 +36,21 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/status
 curl -s -H "Authorization: Bearer $TOKEN" $BASE/sessions
 ```
 
+## 配套技能（内置，装好即用）
+
+本插件自带一个 skill：**`dsh-session-status`**。它的作用是让 agent 在遇到
+「任务都跑完了吗 / 查一下所有会话 / 有需要我审批的吗 / 那个会话开发得如何了」
+这类**状态问题**时，走本插件的接口去查，而不是去读磁盘投影缓存或临时写脚本。
+
+- **随插件安装**：激活时自动复制到技能库（`~/.agents/skills/dsh-session-status`）
+- **升级随插件**：插件版本变化时整目录覆盖，源头始终在插件里
+- **可禁用**：在「技能管理」里关掉即可，文件仍在但不注入模型
+- **不覆盖你的改动**：若 SKILL.md 的 `x-provider` 不再是 `dsh-session-api`，插件会认为该目录已被你接管，之后既不覆盖也不删除
+
+技能正文会教 agent：端口要动态探测（DSH 重启会换端口）、token 从
+`~/.dsh/session-api/token` 取、先查 `GET /capabilities` 再按需用只读接口，
+以及**接口（实时真源）与磁盘投影缓存（含历史归档）口径不同**这一点。
+
 ## 输出格式：JSON 或 Markdown
 
 所有**只读**接口都支持 `?format=md` 返回 Markdown 文本（表格、标题、列表），方便直接阅读或塞进聊天窗口。
@@ -201,6 +216,7 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 ## 限制
 
 - **仅本机**：设计如此，不提供外网访问
+- **技能同步可关闭**：`cordis.patch.yml` 里设 `syncSkills: false` 后插件不再写技能库（已同步的副本不会被自动删除，可在技能管理里移除）
 - **新建会话要求目录已存在**：`cwd` / `path` 必须是**已经存在的目录**，插件不会替你创建。原因：宿主创建会话时会对 `cwd` 执行 `mkdir --recursive`，若不设限，持有 token 的调用方可在磁盘任意位置造目录树。这与界面「添加工作区」的约束一致——工作区只能从已存在的目录登记。
 - **不能指定 sessionId**：会话 ID 由 DSH 生成，接口不提供自定义，避免与「复用已有会话」的语义混淆。
 - **权限切换要求会话已打开**：`/permission` 需要活的 Agent；未打开的会话会返回 `NOT_OPEN`
