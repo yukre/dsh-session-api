@@ -653,6 +653,9 @@ async function createHarness(overrides = {}) {
     get(name) {
       if (name === 'sessionController') return controller
       if (name === 'workspaceRegistry') return registry
+      // The connection trust service DSH routes consult. Absent by default,
+      // which must keep the route working on loopback + token alone.
+      if (name === 'connection') return overrides.connection
       return undefined
     },
     inject(names, callback) {
@@ -1499,4 +1502,75 @@ test('an array body is refused for the same reason', async () => {
   })
   assert.equal(answer.status, 400)
   assert.equal(JSON.parse(answer.body).code, 'BAD_JSON')
+})
+
+/* ------------------------------------------------------------------ *
+ * Connection trust fence
+ *
+ * `webServer.register` does not apply DSH's connection trust check, so the
+ * loopback bind and the peer-address test are not enough by themselves: a page
+ * on another origin, or a DNS-rebinding host header, still reaches the route.
+ * The handler consults `connection.requestRejection` — the same gate DSH's own
+ * routes use — before anything else.
+ * ------------------------------------------------------------------ */
+
+
+/* ------------------------------------------------------------------ *
+ * Connection trust fence
+ *
+ * `webServer.register` does not apply DSH's connection trust check, so a
+ * loopback bind plus a peer-address test are not enough on their own: a page on
+ * another origin, or a DNS-rebinding Host header, still reaches the route. The
+ * handler consults `connection.requestRejection` — the same gate DSH's own
+ * routes use — before anything else.
+ * ------------------------------------------------------------------ */
+
+test('a request the connection service rejects is refused before any work', async () => {
+  // 403 is what DSH answers to an untrusted origin or a rebound Host header.
+  const { route } = await createHarness({ connection: { requestRejection: () => 403 } })
+  const answer = await call(route, '/session-api/status', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 403)
+  assert.equal(JSON.parse(answer.body).code, 'UNTRUSTED_CONNECTION')
+})
+
+test('an accepted request proceeds normally', async () => {
+  const { route } = await createHarness({ connection: { requestRejection: () => undefined } })
+  const answer = await call(route, '/session-api/status', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+  assert.equal(JSON.parse(answer.body).ok, true)
+})
+
+test('a host without the connection service still serves', async () => {
+  // Absent service: the route keeps working on loopback + token alone rather
+  // than failing closed, which would break every existing caller.
+  const { route } = await createHarness({ connection: undefined })
+  const answer = await call(route, '/session-api/status', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(answer.status, 200)
+})
+
+test('a throwing connection check does not crash the route', async () => {
+  const { route } = await createHarness({
+    connection: { requestRejection: () => { throw new Error('boom') } },
+  })
+  const answer = await call(route, '/session-api/status', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  // Treated as "no opinion": the request still reaches the normal auth path
+  // instead of failing the whole route on a malformed check.
+  assert.equal(answer.status, 200)
+})
+
+test('the fence runs before the token is examined', async () => {
+  const { route } = await createHarness({ connection: { requestRejection: () => 401 } })
+  // No authorization header at all: the connection refusal must win, which
+  // proves the check sits ahead of auth rather than inside it.
+  const answer = await call(route, '/session-api/status')
+  assert.equal(answer.status, 401)
+  assert.equal(JSON.parse(answer.body).code, 'UNTRUSTED_CONNECTION')
 })

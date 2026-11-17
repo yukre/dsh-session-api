@@ -216,6 +216,7 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 ## 限制
 
 - **仅本机**：设计如此，不提供外网访问
+- **连接信任检查**：路由入口先过 `connection.requestRejection`（DSH 自己的准入判定），挡住跨站 Origin 与 DNS 重绑定。`webServer.register` 本身不做这层检查，光靠回环绑定和对端地址是不够的
 - **技能同步可关闭**：`cordis.patch.yml` 里设 `syncSkills: false` 后插件不再写技能库（已同步的副本不会被自动删除，可在技能管理里移除）
 - **新建会话要求目录已存在**：`cwd` / `path` 必须是**已经存在的目录**，插件不会替你创建。原因：宿主创建会话时会对 `cwd` 执行 `mkdir --recursive`，若不设限，持有 token 的调用方可在磁盘任意位置造目录树。这与界面「添加工作区」的约束一致——工作区只能从已存在的目录登记。
 - **不能指定 sessionId**：会话 ID 由 DSH 生成，接口不提供自定义，避免与「复用已有会话」的语义混淆。
