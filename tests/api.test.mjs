@@ -27,7 +27,10 @@ function makeReq(path, options = {}) {
   const req = Readable.from(payload.length === 0 ? [] : [Buffer.from(payload)])
   req.method = method
   req.url = path
-  req.headers = {
+  req.headers = { host: '127.0.0.1:8080',
+    // Node's HTTP server always supplies Host; the fence depends on that, so
+    // the stub must supply it too rather than diverging from the real request.
+    host: '127.0.0.1:8080',
     ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     ...headers,
   }
@@ -226,7 +229,7 @@ test('a bodyless command is allowed, a non-JSON body is not', async () => {
   const req = Readable.from([Buffer.from('text=1')])
   req.method = 'POST'
   req.url = '/session-api/sessions/session-a/prompt'
-  req.headers = {
+  req.headers = { host: '127.0.0.1:8080',
     authorization: `Bearer ${TOKEN}`,
     'content-type': 'text/plain',
     'content-length': '6',
@@ -591,7 +594,7 @@ test('conversation limit rejects a non-numeric value instead of truncating', asy
     const req = Readable.from([])
     req.method = 'GET'
     req.url = `/session-api/sessions/session-a/conversation${query}`
-    req.headers = { authorization: `Bearer ${TOKEN}` }
+    req.headers = { host: '127.0.0.1:8080', authorization: `Bearer ${TOKEN}` }
     req.socket = { remoteAddress: '127.0.0.1' }
     const res = { statusCode: 200, setHeader() {}, end(t) { settle(t ?? '') } }
     await registered.handler(req, res)
@@ -1481,7 +1484,7 @@ test('a non-object JSON body is 400, never a 500', async () => {
     const req = Readable.from([Buffer.from(raw)])
     req.method = 'POST'
     req.url = '/session-api/sessions/session-a/prompt'
-    req.headers = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }
+    req.headers = { host: '127.0.0.1:8080', authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' }
     req.socket = { remoteAddress: '127.0.0.1' }
     let settle
     const done = new Promise(resolve => { settle = resolve })
@@ -1505,72 +1508,69 @@ test('an array body is refused for the same reason', async () => {
 })
 
 /* ------------------------------------------------------------------ *
- * Connection trust fence
+ * Host / Origin fence
  *
  * `webServer.register` does not apply DSH's connection trust check, so the
- * loopback bind and the peer-address test are not enough by themselves: a page
- * on another origin, or a DNS-rebinding host header, still reaches the route.
- * The handler consults `connection.requestRejection` — the same gate DSH's own
- * routes use — before anything else.
+ * loopback bind and peer-address test are not enough: a DNS-rebinding Host
+ * header or a cross-site Origin still reaches the route. The handler applies
+ * the Host/Origin half of DSH's own isTrustedApiRequest — but NOT its
+ * peer-authentication half, which would refuse the very callers this surface
+ * exists for.
  * ------------------------------------------------------------------ */
 
-
-/* ------------------------------------------------------------------ *
- * Connection trust fence
- *
- * `webServer.register` does not apply DSH's connection trust check, so a
- * loopback bind plus a peer-address test are not enough on their own: a page on
- * another origin, or a DNS-rebinding Host header, still reaches the route. The
- * handler consults `connection.requestRejection` — the same gate DSH's own
- * routes use — before anything else.
- * ------------------------------------------------------------------ */
-
-test('a request the connection service rejects is refused before any work', async () => {
-  // 403 is what DSH answers to an untrusted origin or a rebound Host header.
-  const { route } = await createHarness({ connection: { requestRejection: () => 403 } })
+test('a rebinding Host header is refused', async () => {
+  const { route } = await createHarness()
   const answer = await call(route, '/session-api/status', {
-    headers: { authorization: `Bearer ${TOKEN}` },
+    headers: { authorization: `Bearer ${TOKEN}`, host: 'evil.example' },
   })
   assert.equal(answer.status, 403)
   assert.equal(JSON.parse(answer.body).code, 'UNTRUSTED_CONNECTION')
 })
 
-test('an accepted request proceeds normally', async () => {
-  const { route } = await createHarness({ connection: { requestRejection: () => undefined } })
+test('a cross-site Origin is refused', async () => {
+  const { route } = await createHarness()
   const answer = await call(route, '/session-api/status', {
-    headers: { authorization: `Bearer ${TOKEN}` },
+    headers: { authorization: `Bearer ${TOKEN}`, host: '127.0.0.1:8080', origin: 'http://evil.example' },
   })
-  assert.equal(answer.status, 200)
-  assert.equal(JSON.parse(answer.body).ok, true)
+  assert.equal(answer.status, 403)
 })
 
-test('a host without the connection service still serves', async () => {
-  // Absent service: the route keeps working on loopback + token alone rather
-  // than failing closed, which would break every existing caller.
-  const { route } = await createHarness({ connection: undefined })
+test('the cross-site fetch marker alone is enough to refuse', async () => {
+  const { route } = await createHarness()
   const answer = await call(route, '/session-api/status', {
-    headers: { authorization: `Bearer ${TOKEN}` },
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      host: '127.0.0.1:8080',
+      'sec-fetch-site': 'cross-site',
+    },
+  })
+  assert.equal(answer.status, 403)
+})
+
+test('an opaque origin is refused', async () => {
+  const { route } = await createHarness()
+  const answer = await call(route, '/session-api/status', {
+    headers: { authorization: `Bearer ${TOKEN}`, host: '127.0.0.1:8080', origin: 'null' },
+  })
+  assert.equal(answer.status, 403)
+})
+
+test('a loopback Host with no Origin is accepted (curl)', async () => {
+  const { route } = await createHarness()
+  const answer = await call(route, '/session-api/status', {
+    headers: { authorization: `Bearer ${TOKEN}`, host: '127.0.0.1:8080' },
   })
   assert.equal(answer.status, 200)
 })
 
-test('a throwing connection check does not crash the route', async () => {
-  const { route } = await createHarness({
-    connection: { requestRejection: () => { throw new Error('boom') } },
-  })
+test('an Origin matching the Host is accepted (the page)', async () => {
+  const { route } = await createHarness()
   const answer = await call(route, '/session-api/status', {
-    headers: { authorization: `Bearer ${TOKEN}` },
+    headers: {
+      authorization: `Bearer ${TOKEN}`,
+      host: '127.0.0.1:8080',
+      origin: 'http://127.0.0.1:8080',
+    },
   })
-  // Treated as "no opinion": the request still reaches the normal auth path
-  // instead of failing the whole route on a malformed check.
   assert.equal(answer.status, 200)
-})
-
-test('the fence runs before the token is examined', async () => {
-  const { route } = await createHarness({ connection: { requestRejection: () => 401 } })
-  // No authorization header at all: the connection refusal must win, which
-  // proves the check sits ahead of auth rather than inside it.
-  const answer = await call(route, '/session-api/status')
-  assert.equal(answer.status, 401)
-  assert.equal(JSON.parse(answer.body).code, 'UNTRUSTED_CONNECTION')
 })
