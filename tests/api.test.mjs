@@ -1686,6 +1686,46 @@ test('re-asserting never stacks two wrappers on one request', async () => {
   assert.equal(qqCalls.length, 1)
 })
 
+test('a channel that captured our wrapper as its own previous cannot recurse forever', async () => {
+  // This is the real im-qqbot shape: at install it binds whatever `uq.ask` is
+  // (`origAsk = uq.ask.bind(uq)`) and, for a non-QQ session, delegates to that
+  // binding. If im-qqbot installed AFTER us, that binding IS our wrapper — so
+  // adopting the QQ function as downstream would send the request straight back
+  // into us, forever. The re-entrancy guard must terminate it at the original.
+  const { route, service } = racerHarness()
+  const ours = service.ask
+  const coreCalls = []
+  // The QQ channel: QQ sessions park, anything else delegates to its captured
+  // previous (our wrapper).
+  const capture = ours.bind(service)
+  service.ask = function qqChannelAsk(request) {
+    if (request?.agent?.id === 'session-qq') return Promise.withResolvers().promise
+    coreCalls.push(request)
+    return capture(request)
+  }
+
+  // Re-assert so the QQ function becomes our downstream.
+  await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(service.ask.__sessionApiRace, true)
+
+  // A non-QQ session: the request must reach the original implementation once,
+  // not bounce between the two wrappers.
+  const outcome = await Promise.race([
+    service.ask({
+      questions: [{ id: 'q1', question: '会不会无限递归' }],
+      agent: { sessionId: 'session-q', id: 'session-q' },
+      wait: { callId: 'call-race-loop' },
+    }),
+    new Promise(resolve => setTimeout(() => resolve('__HUNG__'), 500)),
+  ])
+  // The stub's core `ask` parks forever, so a hang here is the bug. What proves
+  // termination is that it reached the core exactly once instead of spinning.
+  assert.equal(outcome, '__HUNG__')
+  assert.equal(coreCalls.length, 1)
+})
+
 test('an ask with no live agent is passed through untouched', () => {
   const { service, calls } = racerHarness()
   // A programmatic ask: no agent, so nothing to route an external decision to.

@@ -1,0 +1,24 @@
+fix: keep the racer outermost when a channel replaces ask
+
+im-qqbot does not wrap `userQuestions.ask`, it REPLACES it. Installing
+after this plugin would therefore drop the wrapper with no error, and
+every QQ session — the headless case the feature exists for — would
+silently lose the race.
+
+The wrapper now owns a mutable downstream and re-asserts itself on
+install, on an unref'd interval, and on every question route read. It
+adopts a later installer as its downstream instead of being replaced by
+it, so that channel keeps handling its own sessions.
+
+Adopting creates a second trap: im-qqbot binds `uq.ask` at install, so if
+it installed after us its captured "previous" IS our wrapper. For a
+non-QQ session it delegates there, and delegating onward to the current
+downstream would ping-pong forever. A WeakSet of request identities
+short-circuits that round trip to the original implementation. The guard
+is a WeakSet and not a marker property because the request is spread into
+the forwarded event and the gateway rejects any own key that is not a
+plain string.
+
+Adds 4 tests (99 total): replacement does not steal the race, repeated
+re-assertion never stacks layers, the captured-previous round trip
+terminates at the core exactly once, and the switch still disables it.
