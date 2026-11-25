@@ -9,3 +9,5 @@ pnpm-lock.yaml
 # Logs and temp files
 *.log
 *.tmp
+.commit-msg
+.git-commit-msg.txt
