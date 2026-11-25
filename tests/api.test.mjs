@@ -1402,9 +1402,20 @@ test('answering a question on a session with no live agent is refused', async ()
  * @returns the route, the spy on the downstream call, and a way to release it.
  */
 function racerHarness(options = {}) {
+  // Auto-teardown: `pendingQuestions` is module-global while each harness owns
+  // its own controller, so a test that leaves a parked question behind leaks it
+  // into the next test's list. Registering the cleanup on the test context is
+  // the only way to make that impossible to forget.
+  const context = options.test
+  const cleanups = []
+  const dispose = () => {
+    for (const cleanup of cleanups) if (typeof cleanup === 'function') cleanup()
+    cleanups.length = 0
+  }
+  if (context !== undefined) context.after(dispose)
   const calls = []
   const releases = []
-  const service = {
+  const service = options.serviceOverride ?? {
     /**
      * Stand-in for the real `ask`: parks until `release()` is called, exactly
      * like a page card or a QQ channel waits for its human.
@@ -1435,7 +1446,6 @@ function racerHarness(options = {}) {
   }
   const agents = { get: id => (id === 'session-q' ? { sessionId: 'session-q', id: 'session-q' } : undefined) }
   let registered
-  const cleanups = []
   const ctx = {
     logger: { info() {}, warn() {} },
     get(name) {
@@ -1455,7 +1465,14 @@ function racerHarness(options = {}) {
     },
   }
   apply(ctx, { token: TOKEN, requireLoopback: true, syncSkills: false, ...options.config })
-  return { route: registered, service, calls, releases, cleanups, agents }
+  return {
+    route: registered,
+    service,
+    calls,
+    releases,
+    agents,
+    dispose,
+  }
 }
 
 /** A live ask that the plugin is racing, as an external caller would trigger it. */
@@ -1473,8 +1490,8 @@ function askInBackground(service, overrides = {}) {
   })
 }
 
-test('a legacy (blocking) ask is listed as answerable even though the projection is empty', async () => {
-  const { route, service } = racerHarness()
+test('a legacy (blocking) ask is listed as answerable even though the projection is empty', async (t) => {
+  const { route, service } = racerHarness({ test: t })
   // No `wait` at all: this is the legacy schema, which never enters the
   // projection. The plugin must still publish it.
   const asking = askInBackground(service, { wait: undefined })
@@ -1503,8 +1520,8 @@ test('a legacy (blocking) ask is listed as answerable even though the projection
   assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['A'] }] })
 })
 
-test('an external answer wins the race and the agent continues with it', async () => {
-  const { route, service, releases } = racerHarness()
+test('an external answer wins the race and the agent continues with it', async (t) => {
+  const { route, service, releases } = racerHarness({ test: t })
   const asking = askInBackground(service)
   await new Promise(r => setTimeout(r, 0))
 
@@ -1527,8 +1544,8 @@ test('an external answer wins the race and the agent continues with it', async (
   await new Promise(r => setTimeout(r, 0))
 })
 
-test('whoever answers first wins — the page answering first discards a later API answer', async () => {
-  const { route, service, releases } = racerHarness()
+test('whoever answers first wins — the page answering first discards a later API answer', async (t) => {
+  const { route, service, releases } = racerHarness({ test: t })
   const asking = askInBackground(service)
   await new Promise(r => setTimeout(r, 0))
 
@@ -1546,8 +1563,8 @@ test('whoever answers first wins — the page answering first discards a later A
   assert.equal(JSON.parse(late.body).code, 'QUESTION_NOT_FOUND')
 })
 
-test('a downstream failure reaches the tool unchanged', async () => {
-  const { service, releases } = racerHarness()
+test('a downstream failure reaches the tool unchanged', async (t) => {
+  const { service, releases } = racerHarness({ test: t })
   const asking = askInBackground(service)
   await new Promise(r => setTimeout(r, 0))
 
@@ -1555,8 +1572,8 @@ test('a downstream failure reaches the tool unchanged', async () => {
   await assert.rejects(asking, /QQ channel unloaded/)
 })
 
-test('the batch must name every asked question exactly once', async () => {
-  const { route, service } = racerHarness()
+test('the batch must name every asked question exactly once', async (t) => {
+  const { route, service } = racerHarness({ test: t })
   const asking = service.ask({
     questions: [{ id: 'q1', question: '一' }, { id: 'q2', question: '二' }],
     // The wrapper routes on `agent.id`, which is what a real live agent carries.
@@ -1589,8 +1606,8 @@ test('the batch must name every asked question exactly once', async () => {
   assert.deepEqual(result.answers[1], { id: 'q2', selected: [], custom: '自己填' })
 })
 
-test('a cancelled turn withdraws its question instead of leaving it addressable', async () => {
-  const { route, service } = racerHarness()
+test('a cancelled turn withdraws its question instead of leaving it addressable', async (t) => {
+  const { route, service } = racerHarness({ test: t })
   const lifetime = new AbortController()
   const asking = askInBackground(service, { signal: lifetime.signal })
   await new Promise(r => setTimeout(r, 0))
@@ -1611,13 +1628,13 @@ test('a cancelled turn withdraws its question instead of leaving it addressable'
   void asking.catch(() => {})
 })
 
-test('a channel that REPLACES ask (im-qqbot) does not steal the race', async () => {
+test('a channel that REPLACES ask (im-qqbot) does not steal the race', async (t) => {
   // im-qqbot assigns a brand-new function to `userQuestions.ask`; it never
   // calls the previous implementation. If we merely patched once, installing
   // after us would hide the race for every QQ session — the exact case this
   // feature exists for. The wrapper must adopt the interloper as downstream and
   // put itself back on top.
-  const { route, service } = racerHarness()
+  const { route, service } = racerHarness({ test: t })
   const ours = service.ask
   assert.equal(ours.__sessionApiRace, true)
 
@@ -1657,8 +1674,8 @@ test('a channel that REPLACES ask (im-qqbot) does not steal the race', async () 
   assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['A'] }] })
 })
 
-test('re-asserting never stacks two wrappers on one request', async () => {
-  const { route, service } = racerHarness()
+test('re-asserting never stacks two wrappers on one request', async (t) => {
+  const { route, service } = racerHarness({ test: t })
   const qqCalls = []
   service.ask = function qqChannelAsk(request) {
     qqCalls.push(request)
@@ -1686,13 +1703,13 @@ test('re-asserting never stacks two wrappers on one request', async () => {
   assert.equal(qqCalls.length, 1)
 })
 
-test('a channel that captured our wrapper as its own previous cannot recurse forever', async () => {
+test('a channel that captured our wrapper as its own previous cannot recurse forever', async (t) => {
   // This is the real im-qqbot shape: at install it binds whatever `uq.ask` is
   // (`origAsk = uq.ask.bind(uq)`) and, for a non-QQ session, delegates to that
   // binding. If im-qqbot installed AFTER us, that binding IS our wrapper — so
   // adopting the QQ function as downstream would send the request straight back
   // into us, forever. The re-entrancy guard must terminate it at the original.
-  const { route, service } = racerHarness()
+  const { route, service } = racerHarness({ test: t })
   const ours = service.ask
   const coreCalls = []
   // The QQ channel: QQ sessions park, anything else delegates to its captured
@@ -1726,8 +1743,186 @@ test('a channel that captured our wrapper as its own previous cannot recurse for
   assert.equal(coreCalls.length, 1)
 })
 
-test('an ask with no live agent is passed through untouched', () => {
-  const { service, calls } = racerHarness()
+test('an API win withdraws the losing channel so it stops advertising the question', async (t) => {
+  // The race is settled, but the wrapped call is deliberately left running. If
+  // it kept running with a live signal, the losing channel would go on
+  // advertising a question that is already answered: the QQ channel would send
+  // the user "⚠️ 提问已超时，未收到回答。" minutes later, and a page card would stay
+  // clickable for a call that can no longer be settled. Both shipped channels
+  // read an abort as "the asker withdrew" and clean up silently, so winning must
+  // abort the downstream signal.
+  const seen = []
+  let received
+  const service = {
+    ask(request) {
+      received = request
+      seen.push({ abortedAtEntry: request.signal?.aborted === true })
+      // Park like a real channel, but resolve on abort the way they do.
+      return new Promise((resolve, reject) => {
+        request.signal?.addEventListener('abort', () => reject(new Error('withdrawn')), { once: true })
+      })
+    },
+    answer() { return false },
+  }
+  const { route } = racerHarness({ test: t, serviceOverride: service })
+  // The harness wraps `service.ask` on install, so the raced entry point is the
+  // wrapped one, not the raw stub captured above.
+  const asking = service.ask({
+    questions: [{ id: 'q1', question: '会被撤回吗' }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-race-withdraw' },
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  const answered = await call(route, '/session-api/sessions/session-q/questions/call-race-withdraw', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(answered.status, 200)
+  assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['A'] }] })
+
+  // The downstream saw a live signal and was then aborted, which is what makes
+  // the losing channel remove its card/entry instead of timing out.
+  assert.equal(seen[0].abortedAtEntry, false)
+  assert.equal(received.signal.aborted, true)
+  assert.equal(received.signal.reason?.code, 'API_WON_RACE')
+})
+
+test('unloading while a question is parked rejects it instead of stranding the turn', async (t) => {
+  const { service, dispose } = racerHarness({ test: t })
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+  // A parked turn whose plugin disappears must fail, not hang forever: the
+  // previous code cleared the queue and left the tool's promise pending.
+  dispose()
+  await assert.rejects(
+    Promise.race([asking, new Promise((_, reject) => setTimeout(() => reject(new Error('__HUNG__')), 500))]),
+    /unloaded/,
+  )
+})
+
+test('a call id held for another session cannot be answered through this one', async (t) => {
+  const { route, service } = racerHarness({ test: t })
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+
+  // The call is parked for session-q; addressing it under another session must
+  // be refused rather than falling through to the service's late-reply path.
+  const wrong = await call(route, '/session-api/sessions/session-other/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(wrong.status, 404)
+  assert.equal(JSON.parse(wrong.body).code, 'QUESTION_NOT_FOUND')
+
+  // The real session can still answer it afterwards.
+  const right = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(right.status, 200)
+  assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['A'] }] })
+})
+
+test('only one of the two competitors can settle a question', async (t) => {
+  // Both sides racing at once is the normal case, not the edge: a user clicks
+  // the page card at the same moment a script POSTs. Exactly one outcome may
+  // reach the model, and the second must be reported as lost rather than
+  // silently overwriting the first.
+  const { route, service, releases } = racerHarness({ test: t })
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+
+  // Fire both without awaiting: whichever resolves first wins in the same tick.
+  const viaApi = call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  releases[0].resolve({ answers: [{ id: 'q1', selected: ['B'] }] })
+
+  const answered = await viaApi
+  const result = await asking
+  const status = answered.status
+  const body = JSON.parse(answered.body)
+
+  if (status === 200) {
+    // The API won, so the model must carry the API's answer and not the page's.
+    assert.equal(body.via, 'api')
+    assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['A'] }] })
+  } else {
+    // The page won, so the model carries the page's answer and the API is told
+    // its answer was lost.
+    assert.equal(status, 404)
+    assert.equal(body.code, 'QUESTION_NOT_FOUND')
+    assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['B'] }] })
+  }
+})
+
+test('the selected shorthand is refused for a multi-question call instead of answering only the first', async (t) => {
+  // The shorthand cannot express "an answer for each of N questions". Silently
+  // answering the first and then failing the all-questions check would report a
+  // problem the caller had no way to avoid; refusing up front names the ids.
+  const { route, service } = racerHarness({ test: t })
+  // The teardown rejects a parked question; keep the handler attached from the
+  // start so that rejection is never reported as unhandled.
+  const asking = service.ask({
+    questions: [{ id: 'q1', question: '一' }, { id: 'q2', question: '二' }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-race-multi' },
+  })
+  void asking.catch(() => {})
+  await new Promise(r => setTimeout(r, 0))
+
+  const shorthand = await call(route, '/session-api/sessions/session-q/questions/call-race-multi', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { selected: 'A' },
+  })
+  assert.equal(shorthand.status, 409)
+  const body = JSON.parse(shorthand.body)
+  assert.equal(body.code, 'BAD_ANSWERS')
+  // The message must be actionable: it lists the ids the caller has to answer.
+  assert.match(body.message, /q1/)
+  assert.match(body.message, /q2/)
+})
+
+test('a retiring controller abandons only its own questions, not a newer instance\'s', async (t) => {
+  // `pendingQuestions` is module-global while controllers come and go on reload.
+  // The rule the ownership stamp enforces is: dispose() reclaims THIS
+  // controller's parked entries and nothing else. Without the stamp, retiring an
+  // old instance would reject a question a newer one just parked — a live
+  // session's question killed for no reason.
+  const first = racerHarness({ test: t })
+  const stale = askInBackground(first.service)
+  // Attach the rejection handler BEFORE the retirement, otherwise Node treats
+  // the rejection as unhandled and fails the test for the wrong reason.
+  const staleOutcome = stale.then(() => 'resolved', error => error.message)
+  await new Promise(r => setTimeout(r, 0))
+
+  // Stand in for a reloaded plugin over the SAME service, then park a question
+  // through the new instance. Installing already retired `first`.
+  const second = racerHarness({ test: t, serviceOverride: first.service })
+  const fresh = askInBackground(second.service)
+  const freshOutcome = fresh.then(() => 'resolved', error => error.message)
+  await new Promise(r => setTimeout(r, 0))
+
+  // The old instance's question died with it (correct: nobody owns it now)...
+  assert.match(await staleOutcome, /unloaded/)
+
+  // ...and the new instance's question was not touched by that retirement.
+  const raced = await Promise.race([
+    freshOutcome,
+    new Promise(resolve => setTimeout(() => resolve('still-pending'), 40)),
+  ])
+  assert.equal(raced, 'still-pending')
+})
+
+test('an ask with no live agent is passed through untouched', (t) => {
+  const { service, calls } = racerHarness({ test: t })
   // A programmatic ask: no agent, so nothing to route an external decision to.
   // The stub parks forever, which is why this call is not awaited: the assertion
   // is that the wrapper forwarded it synchronously rather than parking it.
@@ -1736,29 +1931,53 @@ test('an ask with no live agent is passed through untouched', () => {
   assert.equal(calls[0][0], 'ask')
 })
 
-test('unloading the plugin restores the original ask', () => {
-  const { service, cleanups, calls } = racerHarness()
+test('unloading the plugin restores the original ask', (t) => {
+  const { service, dispose, calls } = racerHarness({ test: t })
   const wrapped = service.ask
-  assert.notEqual(wrapped.__sessionApiRace, undefined)
-  for (const cleanup of cleanups) if (typeof cleanup === 'function') cleanup()
+  assert.equal(wrapped.__sessionApiRace, true)
+  dispose()
   // The wrapper is gone: a new ask reaches the downstream stub directly.
   assert.equal(service.ask.__sessionApiRace, undefined)
   void service.ask({ questions: [{ id: 'q1', question: '卸载后' }], agent: { sessionId: 'session-q' } })
   assert.equal(calls.at(-1)[0], 'ask')
 })
 
-test('answerQuestions: false leaves the service method untouched', async () => {
-  const { service } = racerHarness({ config: { answerQuestions: false } })
+test('a wrapper that outlives its controller becomes a pure pass-through', async (t) => {
+  // A channel that captured the wrapper keeps calling it after a reload. That
+  // call must reach the real implementation WITHOUT parking a question: parking
+  // would publish into the shared queue with no controller to settle it, so an
+  // external caller would see a question it can never answer.
+  const { service, dispose, calls } = racerHarness({ test: t })
+  const stale = service.ask
+  dispose()
+
+  // Invoke the retired wrapper directly, as a captured reference would. Not
+  // awaited: the downstream stub parks until answered, which is the behaviour
+  // under test — that it was called at all.
+  void stale({
+    questions: [{ id: 'q1', question: '谁在答' }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-after-dispose' },
+  }).catch(() => {})
+  // Give the down() microtask a turn.
+  await new Promise(r => setTimeout(r, 0))
+  // It forwarded rather than parking: the stub saw the call and the plugin holds
+  // no entry a caller could mistakenly try to answer.
+  assert.equal(calls.filter(entry => entry[0] === 'ask').length, 1)
+})
+
+test('answerQuestions: false leaves the service method untouched', async (t) => {
+  const { service } = racerHarness({ test: t, config: { answerQuestions: false } })
   assert.equal(service.ask.__sessionApiRace, undefined)
 })
 
-test('a projection-only question is still listed, but marked unanswerable', async () => {
+test('a projection-only question is still listed, but marked unanswerable', async (t) => {
   const active = [{
     callId: 'call-proj-1',
     state: 'continued',
     questions: [{ id: 'q1', question: '投影里的提问', options: [{ label: 'A' }] }],
   }]
-  const { route } = racerHarness({ active })
+  const { route } = racerHarness({ test: t, active })
   const answer = await call(route, '/session-api/sessions/session-q/questions', {
     headers: { authorization: `Bearer ${TOKEN}` },
   })
@@ -1768,8 +1987,8 @@ test('a projection-only question is still listed, but marked unanswerable', asyn
   assert.equal(body.questions[0].answerable, false)
 })
 
-test('a bare selected value expands against the raced question, not the projection', async () => {
-  const { route, service } = racerHarness()
+test('a bare selected value expands against the raced question, not the projection', async (t) => {
+  const { route, service } = racerHarness({ test: t })
   const asking = askInBackground(service)
   await new Promise(r => setTimeout(r, 0))
 
@@ -1784,8 +2003,8 @@ test('a bare selected value expands against the raced question, not the projecti
   assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['B'] }] })
 })
 
-test('the capability table advertises the racing behaviour', async () => {
-  const { route } = racerHarness()
+test('the capability table advertises the racing behaviour', async (t) => {
+  const { route } = racerHarness({ test: t })
   const answer = await call(route, '/session-api/capabilities', {
     headers: { authorization: `Bearer ${TOKEN}` },
   })
@@ -1794,16 +2013,51 @@ test('the capability table advertises the racing behaviour', async () => {
   assert.match(post.summary, /赛跑/)
 })
 
-test('the TTL timer does not hold the process open', () => {
-  // The expiry itself is a 30-minute wait, far too long for a test. What
-  // matters here is that the timer is unref'd: a parked question must never
-  // keep the Host process alive waiting for a caller that may never come.
-  const { service } = racerHarness()
+test('an expired question stops being addressable without disturbing the ask', async (t) => {
+  // The real TTL is 30 minutes. Shorten it so the invariant can be asserted
+  // instead of described: expiry drops the HTTP entry and must NOT settle the
+  // race, because the question is still live for the page or the QQ user. A
+  // timer that resolved the race would answer nothing and lose the question.
+  const { route, service } = racerHarness({ test: t })
+  const original = internals.questionTtl.ms
+  internals.questionTtl.ms = 20
+  t.after(() => { internals.questionTtl.ms = original })
+
   const asking = askInBackground(service)
-  // A referenced timer would keep this test process alive; the runner exiting
-  // cleanly is the assertion, so the parked ask is abandoned on purpose.
+  await new Promise(r => setTimeout(r, 0))
+
+  // Listed while live.
+  const before = JSON.parse((await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })).body)
+  assert.equal(before.questions.length, 1)
+
+  // Let the shortened TTL fire.
+  await new Promise(r => setTimeout(r, 60))
+
+  // Gone from the API...
+  const after = JSON.parse((await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })).body)
+  assert.deepEqual(after.questions, [])
+
+  // ...but the ask is still pending, which is what "do not disturb" means.
+  let settledEarly = false
+  asking.then(() => { settledEarly = true }, () => { settledEarly = true })
+  await new Promise(r => setTimeout(r, 30))
+  assert.equal(settledEarly, false)
+
+  // A late POST reports it as not found rather than reviving a dead race.
+  const late = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(late.status, 404)
+  assert.equal(JSON.parse(late.body).code, 'QUESTION_NOT_FOUND')
+
+  // The harness teardown rejects it; swallow so the test does not warn.
   void asking.catch(() => {})
-  assert.equal(typeof service.ask, 'function')
 })
 
 /* ------------------------------------------------------------------ *

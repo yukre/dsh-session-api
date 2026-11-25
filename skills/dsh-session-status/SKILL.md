@@ -106,6 +106,7 @@ curl -s -X POST "$BASE/sessions/$SID/questions/$CALL_ID" \
 - **回答是赛跑**：界面卡片、QQ 通道、这个接口谁先答谁生效。答成功返回 `via: "api"` 就表示赢了，被驱动的会话如同在对话里作答一样继续。
 - **`answerable: false` 的行不要答**：那是 DSH 投影里可见、但本插件没接管的提问，POST 会返回 `QUESTION_NOT_FOUND`。答之前先看这个字段。
 - **`409 QUESTION_ALREADY_SETTLED` 不是错误**：说明界面或 QQ 已经先答了，以那边为准，不要重试。
+- **简写 `{"selected":"x"}` 只对单个问题有效**；多问题必须用 `answers` 逐项给，否则返回 `409 BAD_ANSWERS` 并列出问题 id。
 
 ### 排队消息
 
