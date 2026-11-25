@@ -83,7 +83,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | GET | `/capabilities` | 接口能力清单（含格式支持） |
 | GET | `/workspaces` | 工作区列表（含 workspaceId，用于新建会话） |
 | GET | `/sessions/:id/approvals` | 列出本插件持有的待决审批 |
-| GET | `/sessions/:id/questions` | 列出待答提问（ask_user_question） |
+| GET | `/sessions/:id/questions` | 列出待答提问（`answerable` 标出能否从此处回答） |
 | GET | `/sessions` | 会话列表 |
 | GET | `/sessions/:id` | 单个会话 |
 | GET | `/sessions/:id/state` | 运行状态、队列、待输入 |
@@ -106,7 +106,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/capabilities
 | POST | `/workspaces/:id/sessions` | `{text, mode?, agentPreset?}` | **在指定工作区新建会话并立即执行首条任务** |
 | POST | `/sessions/create` | `{cwd, text, mode?, agentPreset?}` | 在指定目录（须**已存在**）新建会话并执行首条任务 |
 | POST | `/sessions/:id/approvals/:decisionId` | `{decision: "allow"\|"deny"}` | 裁决一条待决审批（仅本次生效） |
-| POST | `/sessions/:id/questions/:callId` | `{answers:[{id,selected,custom?}]}` | 回答一条待答提问 |
+| POST | `/sessions/:id/questions/:callId` | `{answers:[{id,selected,custom?}]}` | 回答一条待答提问（与界面 / QQ 通道**赛跑**，先到先得） |
 
 ## 示例：在指定工作区新建会话并下达任务
 
@@ -174,10 +174,10 @@ curl -s -X POST "$BASE/sessions/$SID/approvals/$DECISION_ID" \
 
 ## 示例：回答一个提问
 
-`ask_user_question` 让 agent 停下来等选择时，可以从外部作答：
+`ask_user_question` 让 agent 停下来等选择时，可以从外部作答。**回答是「赛跑」的**：谁先答谁生效，先到先得——界面上的卡片、QQ 通道、这个接口三者地位相同。
 
 ```bash
-# 1. 看有什么在等回答（含问题 id 与选项）
+# 1. 看有什么在等回答（含问题 id、选项、以及能否从此处回答）
 curl -s -H "Authorization: Bearer $TOKEN" "$BASE/sessions/$SID/questions?format=md"
 
 # 2. 回答（answers 要为每个问题各提供一项）
@@ -187,13 +187,41 @@ curl -s -X POST "$BASE/sessions/$SID/questions/$CALL_ID" \
   -d '{"answers":[{"id":"q1","selected":["方案 A"]}]}'
 ```
 
-单选场景可以简写，`selected` 会按投影里的第一个问题自动展开：
+单选场景可以简写，`selected` 会自动展开成该问题的 id：
 
 ```bash
 curl -s -X POST "$BASE/sessions/$SID/questions/$CALL_ID" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"selected":"方案 A"}'
 ```
+
+答成功返回：
+
+```json
+{ "ok": true, "callId": "…", "answered": 1, "via": "api" }
+```
+
+`via: "api"` 表示这次回答**赢了赛跑**，被驱动的会话就像在对话里回答了那样继续往下跑；`via: "service"` 表示走的是 DSH 自己的迟到回答通道（该提问插件没接管，通常是 `timed` 且已超时）。
+
+### 两种「答不上」的返回，含义不同
+
+| 返回码 | 含义 | 怎么处理 |
+|---|---|---|
+| `QUESTION_ALREADY_SETTLED`（409） | 别人先答了（界面或 QQ），你的答案没有生效 | 以先答的为准，不用重试 |
+| `QUESTION_NOT_FOUND`（404） | 没有这个待答提问：已回答 / 已超时 / 已随取消撤回 | 重新 `GET /questions` 看现状 |
+
+### 为什么需要这个（不只是「方便」）
+
+DSH 自带的提问有两条通道，**都覆盖不到无头会话**：
+
+- **界面卡片**：走 `user-questions/request` waterfall，需要有人盯着 GUI。
+- **QQ 通道**：`im-qqbot` 直接**替换** `userQuestions.ask`，不加入 waterfall——所以任何只监听 waterfall 的插件对 QQ 会话完全失明。
+
+这个插件改为**包装 `ask` 方法本身**，所以上面两条路径上的提问它都看得见，也都能抢答。QQ 驱动的会话没有人在 GUI 前点时，这就是唯一的救援通道。
+
+> 早期版本（≤1.6.1）只读 DSH 的 `userQuestions` 投影，而**那份投影只跟踪 `timed` schema 的调用**；profile 默认是 `legacy` 阻塞模式，于是列表恒空、作答恒 `QUESTION_NOT_FOUND`。1.7 起改为包装 `ask`，两种 schema、两种通道都覆盖。
+
+配置项 `answerQuestions`（默认 `true`）可关掉这一行为，回到「只读列表」。
 
 ## 示例：即时插话
 
@@ -224,8 +252,10 @@ curl -s -X POST $BASE/sessions/$SID/prompt \
 - **审批裁决只放行一次**：DSH 的 `ApprovalOutcome` 只有 `allowed-once` / `rejected` / `cancelled` / `unavailable`，没有「记住放行」。持久放行请改权限档位。
 - **只裁决本插件持有的审批**：`GET /approvals` 列出的是本插件挂起的项。若审批由界面卡片持有，这里会显示为空，而 `pendingInput` 仍可能有值——两者含义不同。
 - **未裁决的审批 5 分钟后自动撤回**：超时按 `cancelled` 处理并释放回合，避免外部长期不响应把会话卡死。
-- **提问裁决要求会话已打开**：与审批不同，提问是通过 `userQuestions.answer()` 直接作答，需要活的 Agent；会话未打开会返回 `NOT_OPEN`。
-- **回答必须覆盖每个问题**：一个问题组里有几项就要给几项（服务会校验），`answers: []` 会被拒绝而不是静默成功。
+- **提问裁决走「赛跑」**：本插件包装 `userQuestions.ask`，把提问同时发布到 HTTP 面；界面卡片、QQ 通道、本接口谁先答谁生效，另外两方的答案被丢弃（不会报错、也不会覆盖）。只有回落到 DSH 自己的迟到回答通道（`via: "service"`）时才要求会话已打开，此时未打开返回 `NOT_OPEN`。
+- **回答必须覆盖每个问题**：一个问题组里有几项就要给几项，且 id 不能重复（插件在赛跑路径上自己校验，服务在迟到通道上校验），`answers: []` 会被拒绝而不是静默成功。
+- **提问 30 分钟未答自动下架**：只从 HTTP 面撤下，**不打断**下游（界面卡片照常等、`timed` 照常超时）。下架后再答返回 `QUESTION_NOT_FOUND`。
+- **legacy 提问没有真实 callId**：阻塞式 schema 不传工具调用 id，插件用 `sessionId#ask-N` 合成一个供外部寻址；它只在本插件队列里有效。
 
 ## 测试
 

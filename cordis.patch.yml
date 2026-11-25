@@ -14,6 +14,9 @@
 #   tokenFile     read the secret from this file instead of `token`
 #   requireLoopback  refuse a request whose socket peer is not loopback
 #   syncSkills    copy the bundled skill into the skill library on activation
+#   answerQuestions  wrap `userQuestions.ask` so an external caller can answer a
+#                 pending question, racing the page card and the QQ channel.
+#                 On by default: a QQ-driven session has nobody at the GUI.
 - insert:
     - id: dsh-session-api
       name: 'dsh-session-api'
@@ -21,3 +24,4 @@
         token: ''
         requireLoopback: true
         syncSkills: true
+        answerQuestions: true

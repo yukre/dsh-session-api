@@ -1287,8 +1287,13 @@ test('GET /sessions/:id/questions lists the waiting question', async () => {
   assert.equal(body.questions.length, 1)
   assert.equal(body.questions[0].callId, 'call-q1')
   assert.equal(body.questions[0].kind, 'question')
+  // A projection-only row is reported, but flagged as NOT answerable here: the
+  // plugin is not racing it, so a POST would find nothing to settle.
+  assert.equal(body.questions[0].answerable, false)
   assert.equal(body.questions[0].questions[0].id, 'q1')
-  assert.deepEqual(body.questions[0].questions[0].options, ['A', 'B'])
+  // Options keep their label and description: a caller choosing an answer needs
+  // the label it should echo back, and the description that explains the choice.
+  assert.deepEqual(body.questions[0].questions[0].options, [{ label: 'A' }, { label: 'B' }])
 })
 
 test('GET questions renders as Markdown', async () => {
@@ -1375,6 +1380,395 @@ test('answering a question on a session with no live agent is refused', async ()
   assert.equal(answer.status, 409)
   assert.equal(JSON.parse(answer.body).code, 'NOT_OPEN')
 })
+
+/* ------------------------------------------------------------------ *
+ * The question racer — the plugin wraps `userQuestions.ask` so an external
+ * caller can answer whatever the agent asked, including the two cases DSH's
+ * own late-reply path cannot reach: a blocking `legacy` call (never enters the
+ * projection) and a QQ-driven session (im-qqbot REPLACES `ask` rather than
+ * joining the waterfall, so a listener would never see it).
+ *
+ * Every test below drives a REAL wrapped ask through the REAL HTTP route, which
+ * is the only way to prove the two halves are wired to each other.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A harness whose `userQuestions.ask` is the plugin-wrapped one.
+ *
+ * The stub below mirrors the real service's contract closely enough for the
+ * race: `ask` returns a promise that settles only when someone answers, which
+ * is what makes "who wins" observable.
+ * @param options - `type` selects which downstream channel owns the ask.
+ * @returns the route, the spy on the downstream call, and a way to release it.
+ */
+function racerHarness(options = {}) {
+  const calls = []
+  const releases = []
+  const service = {
+    /**
+     * Stand-in for the real `ask`: parks until `release()` is called, exactly
+     * like a page card or a QQ channel waits for its human.
+     * @returns a promise for the downstream answer.
+     */
+    ask(request) {
+      calls.push(['ask', request])
+      const parked = Promise.withResolvers()
+      releases.push({
+        resolve: value => parked.resolve(value),
+        reject: error => parked.reject(error),
+      })
+      // A downstream channel that answers by itself (the QQ timeout path).
+      if (options.autoAnswer !== undefined) parked.resolve(options.autoAnswer)
+      return parked.promise
+    },
+    answer(agent, callId, answer) {
+      calls.push(['answer', agent.sessionId, callId, answer])
+      return options.serviceAnswer ?? false
+    },
+  }
+  const controller = {
+    async list() { return { items: [] } },
+    async projections() {
+      return { kind: 'sequenced', values: { userQuestions: { active: options.active ?? [], settled: [] } } }
+    },
+    async state() { return { running: true, active: true, queue: [], pendingInput: [] } },
+  }
+  const agents = { get: id => (id === 'session-q' ? { sessionId: 'session-q', id: 'session-q' } : undefined) }
+  let registered
+  const cleanups = []
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    get(name) {
+      if (name === 'sessionController') return controller
+      if (name === 'userQuestions') return service
+      if (name === 'agents') return agents
+      return undefined
+    },
+    on() { return () => {} },
+    effect(fn) {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') cleanups.push(cleanup)
+      return cleanup
+    },
+    inject(names, callback) {
+      callback({ effect(fn) { fn() }, webServer: { register(r) { registered = r; return () => {} } } })
+    },
+  }
+  apply(ctx, { token: TOKEN, requireLoopback: true, syncSkills: false, ...options.config })
+  return { route: registered, service, calls, releases, cleanups, agents }
+}
+
+/** A live ask that the plugin is racing, as an external caller would trigger it. */
+function askInBackground(service, overrides = {}) {
+  return service.ask({
+    questions: [{
+      id: 'q1',
+      question: '选哪个方案？',
+      header: '方案',
+      options: [{ label: 'A' }, { label: 'B' }],
+    }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-race-1' },
+    ...overrides,
+  })
+}
+
+test('a legacy (blocking) ask is listed as answerable even though the projection is empty', async () => {
+  const { route, service } = racerHarness()
+  // No `wait` at all: this is the legacy schema, which never enters the
+  // projection. The plugin must still publish it.
+  const asking = askInBackground(service, { wait: undefined })
+  await new Promise(r => setTimeout(r, 0))
+
+  const listed = await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(listed.body)
+  assert.equal(listed.status, 200)
+  assert.equal(body.questions.length, 1)
+  assert.equal(body.questions[0].answerable, true)
+  assert.equal(body.questions[0].source, 'session-api')
+  // The synthetic id must be addressable, otherwise listing it is useless.
+  assert.match(body.questions[0].callId, /^session-q#ask-\d+$/)
+
+  const answered = await call(route, `/session-api/sessions/session-q/questions/${encodeURIComponent(body.questions[0].callId)}`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(answered.status, 200)
+  assert.equal(JSON.parse(answered.body).via, 'api')
+
+  const result = await asking
+  assert.deepEqual(result, { answers: [{ id: 'q1', selected: ['A'] }] })
+})
+
+test('an external answer wins the race and the agent continues with it', async () => {
+  const { route, service, releases } = racerHarness()
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+
+  const answered = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['B'] }] },
+  })
+  assert.equal(answered.status, 200)
+  const outcome = JSON.parse(answered.body)
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.via, 'api')
+
+  // The very promise the tool awaits now carries the external answer: this is
+  // what "the session continues as if answered in the conversation" means.
+  assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['B'] }] })
+  // The page card is still parked downstream; settling it afterwards must not
+  // resurrect the question.
+  releases[0].resolve({ answers: [{ id: 'q1', selected: ['A'] }] })
+  await new Promise(r => setTimeout(r, 0))
+})
+
+test('whoever answers first wins — the page answering first discards a later API answer', async () => {
+  const { route, service, releases } = racerHarness()
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+
+  // The page (or a QQ user) answers first.
+  releases[0].resolve({ answers: [{ id: 'q1', selected: ['A'] }] })
+  assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['A'] }] })
+
+  // A late HTTP answer must be reported as lost, not as applied.
+  const late = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['B'] }] },
+  })
+  assert.equal(late.status, 404)
+  assert.equal(JSON.parse(late.body).code, 'QUESTION_NOT_FOUND')
+})
+
+test('a downstream failure reaches the tool unchanged', async () => {
+  const { service, releases } = racerHarness()
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+
+  releases[0].reject(new Error('QQ channel unloaded'))
+  await assert.rejects(asking, /QQ channel unloaded/)
+})
+
+test('the batch must name every asked question exactly once', async () => {
+  const { route, service } = racerHarness()
+  const asking = service.ask({
+    questions: [{ id: 'q1', question: '一' }, { id: 'q2', question: '二' }],
+    // The wrapper routes on `agent.id`, which is what a real live agent carries.
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-race-2' },
+  })
+  await new Promise(r => setTimeout(r, 0))
+
+  // Only one of two questions answered.
+  const partial = await call(route, '/session-api/sessions/session-q/questions/call-race-2', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(partial.status, 409)
+  assert.equal(JSON.parse(partial.body).code, 'BAD_ANSWERS')
+
+  // The real one.
+  const full = await call(route, '/session-api/sessions/session-q/questions/call-race-2', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [
+      { id: 'q1', selected: ['A'] },
+      { id: 'q2', selected: [], custom: '自己填' },
+    ] },
+  })
+  assert.equal(full.status, 200)
+  const result = await asking
+  assert.equal(result.answers.length, 2)
+  assert.deepEqual(result.answers[1], { id: 'q2', selected: [], custom: '自己填' })
+})
+
+test('a cancelled turn withdraws its question instead of leaving it addressable', async () => {
+  const { route, service } = racerHarness()
+  const lifetime = new AbortController()
+  const asking = askInBackground(service, { signal: lifetime.signal })
+  await new Promise(r => setTimeout(r, 0))
+
+  lifetime.abort(new Error('turn cancelled'))
+  await new Promise(r => setTimeout(r, 0))
+
+  const listed = await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.deepEqual(JSON.parse(listed.body).questions, [])
+  const late = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(late.status, 404)
+  void asking.catch(() => {})
+})
+
+test('a channel that REPLACES ask (im-qqbot) does not steal the race', async () => {
+  // im-qqbot assigns a brand-new function to `userQuestions.ask`; it never
+  // calls the previous implementation. If we merely patched once, installing
+  // after us would hide the race for every QQ session — the exact case this
+  // feature exists for. The wrapper must adopt the interloper as downstream and
+  // put itself back on top.
+  const { route, service } = racerHarness()
+  const ours = service.ask
+  assert.equal(ours.__sessionApiRace, true)
+
+  // The QQ channel takes over the slot, with its own routing inside.
+  const qqCalls = []
+  const qq = function qqChannelAsk(request) {
+    qqCalls.push(request)
+    return Promise.withResolvers().promise // parked: the QQ user never replied
+  }
+  service.ask = qq
+
+  // Reading the question list is where a displacement must be noticed.
+  const listed = await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  assert.equal(listed.status, 200)
+  // The wrapper is back on top, and the QQ channel is now its downstream.
+  assert.equal(service.ask.__sessionApiRace, true)
+
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+  // The request still reached the QQ channel: we adopted it, not replaced it.
+  assert.equal(qqCalls.length, 1)
+
+  const questions = JSON.parse((await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })).body).questions
+  assert.equal(questions.length, 1)
+  assert.equal(questions[0].answerable, true)
+
+  const answered = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { answers: [{ id: 'q1', selected: ['A'] }] },
+  })
+  assert.equal(answered.status, 200)
+  assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['A'] }] })
+})
+
+test('re-asserting never stacks two wrappers on one request', async () => {
+  const { route, service } = racerHarness()
+  const qqCalls = []
+  service.ask = function qqChannelAsk(request) {
+    qqCalls.push(request)
+    return Promise.withResolvers().promise
+  }
+  // Displace and re-assert repeatedly: every GET re-asserts, and the displaced
+  // slot must be adopted rather than wrapped again.
+  for (let index = 0; index < 5; index += 1) {
+    const response = await call(route, '/session-api/sessions/session-q/questions', {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    })
+    assert.equal(response.status, 200)
+    service.ask = function laterInstaller(request) {
+      qqCalls.push(request)
+      return Promise.withResolvers().promise
+    }
+  }
+  void service.ask({
+    questions: [{ id: 'q1', question: '只有一层吗' }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-race-nest' },
+  })
+  await new Promise(r => setTimeout(r, 0))
+  // Exactly one downstream delivery: stacked wrappers would multiply this.
+  assert.equal(qqCalls.length, 1)
+})
+
+test('an ask with no live agent is passed through untouched', () => {
+  const { service, calls } = racerHarness()
+  // A programmatic ask: no agent, so nothing to route an external decision to.
+  // The stub parks forever, which is why this call is not awaited: the assertion
+  // is that the wrapper forwarded it synchronously rather than parking it.
+  void service.ask({ questions: [{ id: 'q1', question: '无 agent 的提问' }] })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0], 'ask')
+})
+
+test('unloading the plugin restores the original ask', () => {
+  const { service, cleanups, calls } = racerHarness()
+  const wrapped = service.ask
+  assert.notEqual(wrapped.__sessionApiRace, undefined)
+  for (const cleanup of cleanups) if (typeof cleanup === 'function') cleanup()
+  // The wrapper is gone: a new ask reaches the downstream stub directly.
+  assert.equal(service.ask.__sessionApiRace, undefined)
+  void service.ask({ questions: [{ id: 'q1', question: '卸载后' }], agent: { sessionId: 'session-q' } })
+  assert.equal(calls.at(-1)[0], 'ask')
+})
+
+test('answerQuestions: false leaves the service method untouched', async () => {
+  const { service } = racerHarness({ config: { answerQuestions: false } })
+  assert.equal(service.ask.__sessionApiRace, undefined)
+})
+
+test('a projection-only question is still listed, but marked unanswerable', async () => {
+  const active = [{
+    callId: 'call-proj-1',
+    state: 'continued',
+    questions: [{ id: 'q1', question: '投影里的提问', options: [{ label: 'A' }] }],
+  }]
+  const { route } = racerHarness({ active })
+  const answer = await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  assert.equal(body.questions.length, 1)
+  assert.equal(body.questions[0].callId, 'call-proj-1')
+  assert.equal(body.questions[0].answerable, false)
+})
+
+test('a bare selected value expands against the raced question, not the projection', async () => {
+  const { route, service } = racerHarness()
+  const asking = askInBackground(service)
+  await new Promise(r => setTimeout(r, 0))
+
+  // The projection is empty (legacy call), so expansion MUST come from the
+  // plugin's own queue or the shorthand could not work at all.
+  const answered = await call(route, '/session-api/sessions/session-q/questions/call-race-1', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}` },
+    body: { selected: 'B' },
+  })
+  assert.equal(answered.status, 200)
+  assert.deepEqual(await asking, { answers: [{ id: 'q1', selected: ['B'] }] })
+})
+
+test('the capability table advertises the racing behaviour', async () => {
+  const { route } = racerHarness()
+  const answer = await call(route, '/session-api/capabilities', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })
+  const body = JSON.parse(answer.body)
+  const post = body.endpoints.find(e => e.path === '/sessions/:id/questions/:callId')
+  assert.match(post.summary, /赛跑/)
+})
+
+test('the TTL timer does not hold the process open', () => {
+  // The expiry itself is a 30-minute wait, far too long for a test. What
+  // matters here is that the timer is unref'd: a parked question must never
+  // keep the Host process alive waiting for a caller that may never come.
+  const { service } = racerHarness()
+  const asking = askInBackground(service)
+  // A referenced timer would keep this test process alive; the runner exiting
+  // cleanly is the assertion, so the parked ask is abandoned on purpose.
+  void asking.catch(() => {})
+  assert.equal(typeof service.ask, 'function')
+})
+
+/* ------------------------------------------------------------------ *
+ * End of the racer block.
+ * ------------------------------------------------------------------ */
 
 test('the question endpoints appear in the capability table', async () => {
   const { route } = questionHarness()

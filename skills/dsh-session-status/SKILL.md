@@ -93,6 +93,20 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/sessions/$SID/questions?format=
 
 用户问「有需要我审批的吗」时，对**所有会话**跑一遍这两条，汇总非空的。
 
+**提问可以代为作答**（QQ 驱动的、没人看 GUI 的会话尤其需要）：
+
+```sh
+curl -s -X POST "$BASE/sessions/$SID/questions/$CALL_ID" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"answers":[{"id":"q1","selected":["选项标签"]}]}'
+```
+
+三条口径，别搞混：
+
+- **回答是赛跑**：界面卡片、QQ 通道、这个接口谁先答谁生效。答成功返回 `via: "api"` 就表示赢了，被驱动的会话如同在对话里作答一样继续。
+- **`answerable: false` 的行不要答**：那是 DSH 投影里可见、但本插件没接管的提问，POST 会返回 `QUESTION_NOT_FOUND`。答之前先看这个字段。
+- **`409 QUESTION_ALREADY_SETTLED` 不是错误**：说明界面或 QQ 已经先答了，以那边为准，不要重试。
+
 ### 排队消息
 
 ```sh
