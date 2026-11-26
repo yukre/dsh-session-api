@@ -1388,7 +1388,9 @@ test('answering a question on a session with no live agent is refused', async ()
     headers: { authorization: `Bearer ${TOKEN}` },
     body: { answers: [{ id: 'q1', selected: ['A'] }] },
   })
-  assert.equal(answer.status, 409)
+  // 404, not 409: there is nothing addressable at this session, so the caller's
+  // next move is to re-read the list rather than to fix its request.
+  assert.equal(answer.status, 404)
   assert.equal(JSON.parse(answer.body).code, 'NOT_OPEN')
 })
 
@@ -1449,7 +1451,10 @@ function racerHarness(options = {}) {
     },
   }
   const controller = {
-    async list() { return { items: [] } },
+    // `session-q` exists (the agents stub knows it), so the list must say so:
+    // a stub that reports "no sessions" while answering for one would make the
+    // sessionKnown field untestable.
+    async list() { return { items: [{ sessionId: 'session-q' }] } },
     async projections() {
       return { kind: 'sequenced', values: { userQuestions: { active: options.active ?? [], settled: [] } } }
     },
@@ -1938,6 +1943,49 @@ test('a retiring controller abandons only its own questions, not a newer instanc
     new Promise(resolve => setTimeout(() => resolve('still-pending'), 40)),
   ])
   assert.equal(raced, 'still-pending')
+})
+
+test('re-parking the same call id settles the incumbent instead of hanging it', async (t) => {
+  // `timed` mode retries the same tool call after its foreground window closes.
+  // A Map.set would silently replace the entry and leave the first race promise
+  // unresolved forever, hanging that tool call. The incumbent must be failed.
+  const { service } = racerHarness({ test: t })
+  const first = service.ask({
+    questions: [{ id: 'q1', question: '第一次' }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-dup' },
+  })
+  const firstOutcome = first.then(() => 'resolved', error => error.message)
+  await new Promise(r => setTimeout(r, 0))
+
+  const second = service.ask({
+    questions: [{ id: 'q1', question: '重试' }],
+    agent: { sessionId: 'session-q', id: 'session-q' },
+    wait: { callId: 'call-dup' },
+  })
+  void second.catch(() => {})
+  await new Promise(r => setTimeout(r, 0))
+
+  // The first call must fail rather than hang.
+  assert.match(await firstOutcome, /unloaded/)
+})
+
+test('the question list says whether the session exists', async (t) => {
+  // "Empty list" must not read the same for a session with no questions and for
+  // a mistyped id: the caller would only discover the mistake on its POST.
+  const { route } = racerHarness({ test: t })
+  const known = JSON.parse((await call(route, '/session-api/sessions/session-q/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })).body)
+  assert.equal(known.sessionKnown, true)
+
+  // The stub's list() reports a single session only when asked to enumerate;
+  // an id it does not know is reported as absent.
+  const unknown = JSON.parse((await call(route, '/session-api/sessions/session-zzz/questions', {
+    headers: { authorization: `Bearer ${TOKEN}` },
+  })).body)
+  assert.equal(unknown.sessionKnown, false)
+  assert.deepEqual(unknown.questions, [])
 })
 
 test('an ask with no live agent is passed through untouched', (t) => {
