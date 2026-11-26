@@ -576,6 +576,7 @@ test('conversation limit rejects a non-numeric value instead of truncating', asy
     inject(names, callback) {
       callback({
         effect(fn) { fn() },
+        get: name => ctx.get(name),
         webServer: { register(route) { this._route = route; return () => {} } },
       })
     },
@@ -664,6 +665,7 @@ async function createHarness(overrides = {}) {
     inject(names, callback) {
       callback({
         effect(fn) { fn() },
+        get: name => ctx.get(name),
         webServer: { register(route) { registered = route; return () => {} } },
       })
     },
@@ -776,7 +778,11 @@ test('a failed first task reports the created session id', async () => {
       return undefined
     },
     inject(names, callback) {
-      callback({ effect(fn) { fn() }, webServer: { register(r) { registered = r; return () => {} } } })
+      callback({
+        effect(fn) { fn() },
+        get: name => ctx.get(name),
+        webServer: { register(r) { registered = r; return () => {} } },
+      })
     },
   }
   apply(ctx, { token: TOKEN, requireLoopback: true })
@@ -876,6 +882,7 @@ function approvalHarness() {
     inject(names, callback) {
       callback({
         effect(fn) { fn() },
+        get: name => ctx.get(name),
         webServer: { register(route) { this._route = route; return () => {} } },
       })
     },
@@ -1270,7 +1277,11 @@ function questionHarness(options = {}) {
     on() { return () => {} },
     effect(fn) { fn() },
     inject(names, callback) {
-      callback({ effect(fn) { fn() }, webServer: { register(r) { registered = r; return () => {} } } })
+      callback({
+        effect(fn) { fn() },
+        get: name => ctx.get(name),
+        webServer: { register(r) { registered = r; return () => {} } },
+      })
     },
   }
   apply(ctx, { token: TOKEN, requireLoopback: true })
@@ -1461,7 +1472,15 @@ function racerHarness(options = {}) {
       return cleanup
     },
     inject(names, callback) {
-      callback({ effect(fn) { fn() }, webServer: { register(r) { registered = r; return () => {} } } })
+      callback({
+        effect(fn) {
+          const cleanup = fn()
+          if (typeof cleanup === 'function') cleanups.push(cleanup)
+          return cleanup
+        },
+        get: name => ctx.get(name),
+        webServer: { register(r) { registered = r; return () => {} } },
+      })
     },
   }
   apply(ctx, { token: TOKEN, requireLoopback: true, syncSkills: false, ...options.config })
